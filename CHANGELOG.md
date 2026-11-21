@@ -1,5 +1,29 @@
 # Changelog — Matter2Supla (Gemini Version + Android App)
 
+## 2026-11-21 — `0.4.0-scale64` (Build `40001`) — Skalowanie bramki do 64 urządzeń Matter / 256 pomiarów
+
+### 1. Zdjęcie ukrytych barier w stosie Matter (CHIP) i OpenThread (`matter_project_config.h`, `sdkconfig`)
+- **Kontroler Matter (`matter_project_config.h`):**
+  - `CHIP_CONFIG_CONTROLLER_MAX_ACTIVE_DEVICES`: `8` → **`64`** (usuwa twardy limit 8 równoczesnych urządzeń z `0.3.2-beta4`).
+  - `CHIP_CONFIG_SECURE_SESSION_POOL_SIZE`: `17` → **`72`** (zapobiega wywłaszczaniu aktywnych sesji CASE przez LRU powyżej 17 urządzeń).
+  - `CHIP_CONFIG_CASE_SESSION_RESUME_CACHE_SIZE`: `15` → **`64`** (umożliwia szybkie wznawianie sesji Sigma1 dla wszystkich 64 węzłów).
+  - `CHIP_CONFIG_CONTROLLER_MAX_ACTIVE_CASE_CLIENTS`: **`16`**, `CHIP_CONFIG_UNAUTHENTICATED_CONNECTION_POOL_SIZE`: `4` → **`8`**.
+- **Rdzeń CHIP i OpenThread (`sdkconfig`):**
+  - `CONFIG_MAX_EXCHANGE_CONTEXTS`: `8` → **`64`**, `CONFIG_MAX_UNSOLICITED_MESSAGE_HANDLERS`: `8` → **`32`**, `CONFIG_NUM_TIMERS`: `32` → **`128`**, `CONFIG_MAX_EVENT_QUEUE_SIZE`: `40` → **`96`**.
+  - `CONFIG_CHIP_MEM_ALLOC_MODE_EXTERNAL=y` oraz `CONFIG_CHIP_SYSTEM_CONFIG_POOL_USE_HEAP=y` — dynamiczne pule obiektów CHIP i alokacje `chip::Platform::New` trafiają bezpośrednio do 8 MB zewnętrznego PSRAM zamiast obciążać wewnętrzny SRAM.
+  - `CONFIG_OPENTHREAD_MLE_MAX_CHILDREN`: `10` → **`64`**, `CONFIG_OPENTHREAD_TMF_ADDR_CACHE_ENTRIES`: `20` → **`64`**.
+
+### 2. Zamiana spinlocków na muteksy FreeRTOS i podwojenie tablic w PSRAM
+- **`device_telemetry.cpp`:** `kNodes` `32` → **`64`**, `kSamples` `128` → **`256`**; `readings[256]`, `contacts[64]` i `thread_peers[64]` w PSRAM (`EXT_RAM_BSS_ATTR`), chronione przez zwykły muteks FreeRTOS (`TelemetryLock` bez wyłączania przerwań CPU).
+- **`gateway_mqtt.cpp`:** `tracked` `128` → **`256`**, `nodes` `32` → **`64`**, `desired`/`running`/`tracked` w PSRAM chronione przez muteks FreeRTOS (`MqttLock`).
+- **`quick_add.cpp`:** `MAX_DEVICES` `32` → **`64`** z pełną kompatybilnością wsteczną i powrotną NVS (`registry_v1` zachowuje 32-elementowy format binarny dla bezpiecznego rollbacku do `0.3.2`/`0.3.3`, a powyżej 32 urządzeń zapisywany jest pełny `registry_v2`). Zoptymalizowano też `log_hook()` i `log_tail()` przez dwuetapowy `memcpy()` zamiast pętli bajt po bajcie pod spinlockiem.
+- **`supla_bridge.cpp`, `matter_ota.cpp`, `gateway_recovery.cpp`:** `kMaxSlots`, `s_reporting`, `s_reporting_live`, `states`, `nodes` powiększone z `32` → **`64`**, pula `s_reads` z `8` → **`16`**.
+- **Adaptacyjne tempo subskrypcji i dynamiczne `MinInterval` (`supla_bridge.cpp`):**
+  - `MinInterval` ustawiany automatycznie: `0 s` dla `<= 8` urządzeń, `2 s` dla `9–24` urządzeń, `5 s` dla `25–64` urządzeń.
+  - Ograniczenie nowych inicjalizacji subskrypcji po starcie do maks. **3 węzłów na sekundę** (`kMaxNewSubscribesPerTick = 3`), co zapobiega kolizjom na radiu Thread przy starcie dużej sieci.
+
+---
+
 ## 2026-11-21 — `0.3.3-gemini3` (Build `30303`) — Audyt końcowy i poprawki brzegowe
 
 ### 1. Poprawki firmware `0.3.3-gemini3` (`FW_BUILD 30303`)

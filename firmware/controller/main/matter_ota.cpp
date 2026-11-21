@@ -12,7 +12,7 @@ namespace matter_ota {
 namespace {
 using esp_matter::ota_provider::EspOtaProvider;
 struct State {uint64_t node=0;uint32_t current=0,approved=0;char text[40]{};bool has_current=false;int64_t checked=0;};
-State states[32]; // registry-bound storage, not a tested device capacity
+State states[64]; // Scale64 registry-bound storage
 const State *find_state(uint64_t node) {
     if (!node) return nullptr;
     for(const auto &s:states)if(s.node==node)return &s;

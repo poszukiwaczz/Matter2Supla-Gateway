@@ -240,7 +240,7 @@ struct ElemSlot {
   uint32_t hum_updated;
 };
 
-static const size_t kMaxSlots = 32;
+static const size_t kMaxSlots = 64;
 static ElemSlot s_slots[kMaxSlots] = {};
 static size_t s_slot_count = 0;
 static int s_channels_created = 0;
@@ -623,8 +623,10 @@ struct ReportingLive {
   uint32_t report=0;
   uint16_t maximum=600;
 };
-static ReportingState s_reporting[32];
-static ReportingLive s_reporting_live[32];
+static constexpr size_t kMaxReportingNodes = 64;
+static constexpr size_t kMaxNewSubscribesPerTick = 3;
+static ReportingState s_reporting[kMaxReportingNodes];
+static ReportingLive s_reporting_live[kMaxReportingNodes];
 static portMUX_TYPE s_reporting_mutex=portMUX_INITIALIZER_UNLOCKED;
 static void reporting_live(size_t slot,bool active,bool report=false,uint16_t maximum=0)
 {
@@ -650,9 +652,9 @@ static bool reporting_fresh(uint64_t node,uint32_t now)
 // subscriber node/fabric identities are unaffected.
 class BridgeSubscription final : public esp_matter::controller::subscribe_command {
 public:
-  BridgeSubscription(size_t slot,uint64_t node,
+  BridgeSubscription(size_t slot,uint64_t node,uint16_t min_interval_s,
       chip::Platform::ScopedMemoryBufferWithSize<chip::app::AttributePathParams> &&paths)
-    : subscribe_command(node,std::move(paths),{},0,600,true,
+    : subscribe_command(node,std::move(paths),{},min_interval_s,600,true,
         [](uint64_t peer,const auto &path,auto *data,const auto &status){
           if(quick_add_device_exists(peer))on_attribute_report(peer,path,data,status,device_telemetry::Source::Subscription);
         },nullptr,nullptr,nullptr,nullptr,false),slot_(slot),node_(node) {}
@@ -700,25 +702,27 @@ private:
 };
 
 // Returns true while subscription establishment/reporting owns the normal path.
-static bool maintain_reporting(uint64_t node)
+static bool maintain_reporting(uint64_t node,uint16_t min_interval_s,bool allow_new_subscribe,bool &started_new)
 {
+  started_new=false;
   // Caller holds CHIP lock. Never replace a live owner after an arbitrary timeout.
   size_t slot=0;
-  while(slot<32 && s_reporting[slot].node!=node)++slot;
-  if(slot==32) {
-    for(slot=0;slot<32 && s_reporting[slot].node;++slot){}
-    if(slot==32)return false;
+  while(slot<kMaxReportingNodes && s_reporting[slot].node!=node)++slot;
+  if(slot==kMaxReportingNodes) {
+    for(slot=0;slot<kMaxReportingNodes && s_reporting[slot].node;++slot){}
+    if(slot==kMaxReportingNodes)return false;
     s_reporting[slot].node=node;
   }
   auto &state=s_reporting[slot];const uint32_t now=millis();
-  if(!state.owned && m2s::reporting::retry_due(state.has_attempt,now,state.attempted)) {
+  if(!state.owned && allow_new_subscribe && m2s::reporting::retry_due(state.has_attempt,now,state.attempted)) {
     chip::Platform::ScopedMemoryBufferWithSize<chip::app::AttributePathParams> paths;
     if(!measurement_paths(node,paths))return false;
     state.attempted=now;state.has_attempt=true;
-    auto *command=chip::Platform::New<BridgeSubscription>(slot,node,std::move(paths));
+    auto *command=chip::Platform::New<BridgeSubscription>(slot,node,min_interval_s,std::move(paths));
     if(command) {
       state.owned=true;
-      ESP_LOGI(TAG,"Matter reporting node %llu: subscribing",(unsigned long long)node);
+      started_new=true;
+      ESP_LOGI(TAG,"Matter reporting node %llu: subscribing (min=%us)",(unsigned long long)node,(unsigned)min_interval_s);
       // send_command may synchronously delete command on failure.
       command->send_command();
     }
@@ -727,7 +731,7 @@ static bool maintain_reporting(uint64_t node)
 }
 static void release_removed_reporting()
 {
-  for(size_t i=0;i<32;++i) {
+  for(size_t i=0;i<kMaxReportingNodes;++i) {
     auto &state=s_reporting[i];
     if(!state.node || quick_add_device_exists(state.node))continue;
     reporting_live(i,false);
@@ -749,7 +753,7 @@ struct PendingRead {
   uint32_t id = 0;
   uint32_t started = 0;
 };
-static PendingRead s_reads[8];
+static PendingRead s_reads[16];
 static uint32_t s_read_id = 0;
 
 static PendingRead *find_read(uint64_t node, uint32_t id)
@@ -765,14 +769,16 @@ static void finish_read(uint64_t node, uint32_t id)
 }
 
 // False means all slots are occupied. The caller can resume at this device.
-static bool poll_device(uint64_t node)
+static bool poll_device(uint64_t node,uint16_t min_interval_s,bool allow_new_subscribe,bool &started_new)
 {
   esp_matter::lock::ScopedChipStackLock chip_lock(portMAX_DELAY);
   const uint32_t now = millis();
   release_removed_reporting();
-  const bool reporting = maintain_reporting(node);
+  const bool reporting = maintain_reporting(node,min_interval_s,allow_new_subscribe,started_new);
   if(reporting_fresh(node,now))device_telemetry::refresh_thread(node);
   if(reporting)return true;
+  // If we held back a new subscription due to per-tick pacing, wait for the next 1s tick before fallback polling.
+  if(!allow_new_subscribe)return true;
   // Poll only as a fallback and respect the saved per-device interval.
   ReportingState *policy=nullptr;
   for(auto &entry:s_reporting)if(entry.node==node)policy=&entry;
@@ -819,11 +825,17 @@ static void poll_task(void *)
     // Thread traffic and subscription recovery must not depend on Wi-Fi IP.
     if (s_active) {
       {esp_matter::lock::ScopedChipStackLock lock(portMAX_DELAY);release_removed_reporting();}
-      uint64_t nodes[32];
+      uint64_t nodes[kMaxReportingNodes];
       size_t count = quick_add_devices_copy(nodes, sizeof(nodes) / sizeof(nodes[0]));
+      // Adaptive MinInterval: 0s for <=8 devices, 2s for 9..24 devices, 5s for 25..64 devices
+      const uint16_t min_interval_s = (count <= 8) ? 0 : (count <= 24 ? 2 : 5);
+      size_t new_subscribes_this_tick = 0;
       if (count) cursor %= count;
       for (size_t i = 0; i < count; ++i) {
-        if (!poll_device(nodes[cursor])) break;
+        bool started_new = false;
+        const bool allow_new = (new_subscribes_this_tick < kMaxNewSubscribesPerTick);
+        if (!poll_device(nodes[cursor], min_interval_s, allow_new, started_new)) break;
+        if (started_new) ++new_subscribes_this_tick;
         cursor = (cursor + 1) % count;
       }
     }

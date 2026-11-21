@@ -11,6 +11,7 @@
 #include <nvs.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
+#include <freertos/semphr.h>
 #include <atomic>
 #include <memory>
 #include <cstring>
@@ -21,12 +22,28 @@
 extern "C" esp_err_t supla_bridge_mqtt_command(uint64_t,uint16_t,bool,bool);
 extern "C" uint32_t supla_bridge_stale_seconds(uint64_t,bool);
 namespace gateway {namespace {
-// Keep spinlock-copied config in internal SRAM so portENTER_CRITICAL(&lock) never stalls on external SPI/Octal PSRAM.
-struct Config {bool enabled=false;char uri[181]{},user[81]{},password[129]{},ca[4097]{};} desired,running;
-portMUX_TYPE lock=portMUX_INITIALIZER_UNLOCKED;uint32_t generation=1,applied=0;esp_mqtt_client_handle_t client=nullptr;std::atomic<bool> connected{false},rediscover{false};char base[64]{},availability[88]{};QueueHandle_t commands=nullptr;
+// Scale64: large MQTT config and tracking tables live in PSRAM and are guarded by a FreeRTOS mutex (no IRQ disabling).
+struct Config {bool enabled=false;char uri[181]{},user[81]{},password[129]{},ca[4097]{};};
+EXT_RAM_BSS_ATTR Config desired,running;
+StaticSemaphore_t lock_storage;
+SemaphoreHandle_t lock_handle=nullptr;
+portMUX_TYPE lock_init_mux=portMUX_INITIALIZER_UNLOCKED;
+struct MqttLock {
+ MqttLock() {
+  if(!lock_handle) {
+   portENTER_CRITICAL(&lock_init_mux);
+   if(!lock_handle)lock_handle=xSemaphoreCreateMutexStatic(&lock_storage);
+   portEXIT_CRITICAL(&lock_init_mux);
+  }
+  xSemaphoreTake(lock_handle,portMAX_DELAY);
+ }
+ ~MqttLock(){xSemaphoreGive(lock_handle);}
+};
+uint32_t generation=1,applied=0;esp_mqtt_client_handle_t client=nullptr;std::atomic<bool> connected{false},rediscover{false};char base[64]{},availability[88]{};QueueHandle_t commands=nullptr;
 struct Command {uint64_t node;uint16_t ep;bool on;bool from_mqtt=false;bool from_supla=false;};
 struct Track {uint64_t node=0;uint16_t ep=0;uint8_t metric=0;bool seen=false;uint32_t config_hash=0;int64_t raw=0,last_publish=0;bool last_valid=false,last_available=false;};
-Track tracked[128];
+constexpr size_t kMaxTracked=256,kMaxNodes=64;
+EXT_RAM_BSS_ATTR Track tracked[kMaxTracked];
 struct Description {const char *key,*name,*unit,*device_class,*state_class;uint32_t divisor;};
 const Description descriptions[]={{"temperature","Temperatura","°C","temperature","measurement",100},{"humidity","Wilgotność","%","humidity","measurement",100},{"battery","Bateria","%","battery","measurement",2},{"onoff","Zasilanie","",nullptr,nullptr,1},{"voltage","Napięcie","V","voltage","measurement",1000},{"current","Prąd","A","current","measurement",1000},{"active_power","Moc czynna","W","power","measurement",1000},{"imported_energy","Energia pobrana","kWh","energy","total_increasing",1000000},{"exported_energy","Energia oddana","kWh","energy","total_increasing",1000000}};
 bool uri_valid(const char *s){if(!s){return false;}
@@ -68,28 +85,28 @@ esp_err_t relay_enqueue(uint64_t node,uint16_t ep,bool on,bool from_supla){
 }
 void mqtt_init(){commands=xQueueCreate(16,sizeof(Command));nvs_handle_t h;if(nvs_open("m2s_mqtt",NVS_READONLY,&h)==ESP_OK){size_t n=0;if(nvs_get_str(h,"config",nullptr,&n)==ESP_OK&&n<8192){auto text=std::unique_ptr<char[]>(new(std::nothrow)char[n]);if(text&&nvs_get_str(h,"config",text.get(),&n)==ESP_OK){auto *j=cJSON_Parse(text.get());if(j){auto *en=cJSON_GetObjectItem(j,"enabled");desired.enabled=cJSON_IsTrue(en);for(auto item:{std::pair<const char*,char*>{"uri",desired.uri},{"user",desired.user},{"password",desired.password},{"ca",desired.ca}}){auto *v=cJSON_GetObjectItem(j,item.first);if(cJSON_IsString(v)){size_t limit=!strcmp(item.first,"uri")?sizeof(desired.uri):!strcmp(item.first,"user")?sizeof(desired.user):!strcmp(item.first,"password")?sizeof(desired.password):sizeof(desired.ca);snprintf(item.second,limit,"%s",v->valuestring);}}cJSON_Delete(j);}memset(text.get(),0,n);}}nvs_close(h);}if(desired.enabled&&!uri_valid(desired.uri))desired.enabled=false;supla_cfg_t c{};if(supla_config_copy(&c)==ESP_OK){char hex[33];supla_config_bytes_to_hex(c.guid,hex);snprintf(base,sizeof(base),"%s%.12s",kTopicPrefix,hex);}snprintf(availability,sizeof(availability),"%s/availability",base);}
 esp_err_t mqtt_get(httpd_req_t *r){auto c=std::unique_ptr<Config>(new(std::nothrow)Config);if(!c){return reply(r,503,"Za malo pamieci.");}
-portENTER_CRITICAL(&lock);*c=desired;portEXIT_CRITICAL(&lock);auto *j=cJSON_CreateObject();if(!j){return ESP_ERR_NO_MEM;}
+{MqttLock guard;*c=desired;}auto *j=cJSON_CreateObject();if(!j){return ESP_ERR_NO_MEM;}
 cJSON_AddBoolToObject(j,"enabled",c->enabled);cJSON_AddBoolToObject(j,"connected",connected.load());cJSON_AddStringToObject(j,"uri",c->uri);cJSON_AddStringToObject(j,"user",c->user);cJSON_AddStringToObject(j,"ca",c->ca);cJSON_AddBoolToObject(j,"password_set",c->password[0]);cJSON_AddStringToObject(j,"topic",base);char *text=cJSON_PrintUnformatted(j);cJSON_Delete(j);memset(static_cast<void*>(c.get()),0,sizeof(Config));if(!text){return ESP_ERR_NO_MEM;}
 httpd_resp_set_type(r,"application/json");auto e=httpd_resp_sendstr(r,text);cJSON_free(text);return e;}
 esp_err_t mqtt_save(httpd_req_t *r){if(mutation_busy()){return reply(r,409,"Bramka zajeta.");}
 struct Guard{~Guard(){mutation_done();}} guard;auto *j=body_json(r,8192);if(!j){return reply(r,400,"Niepoprawny JSON.");}
-auto c=std::unique_ptr<Config>(new(std::nothrow)Config);if(!c){cJSON_Delete(j);return reply(r,503,"Za malo pamieci.");}portENTER_CRITICAL(&lock);*c=desired;portEXIT_CRITICAL(&lock);char previous_uri[181];snprintf(previous_uri,sizeof(previous_uri),"%s",c->uri);bool valid=cJSON_IsBool(cJSON_GetObjectItem(j,"enabled"));c->enabled=cJSON_IsTrue(cJSON_GetObjectItem(j,"enabled"));for(auto item:{std::pair<const char*,char*>{"uri",c->uri},{"user",c->user},{"password",c->password},{"ca",c->ca}}){auto *v=cJSON_GetObjectItem(j,item.first);size_t limit=!strcmp(item.first,"uri")?sizeof(c->uri):!strcmp(item.first,"user")?sizeof(c->user):!strcmp(item.first,"password")?sizeof(c->password):sizeof(c->ca);if(v){if(!cJSON_IsString(v)||strlen(v->valuestring)>=limit)valid=false;else if(strcmp(item.first,"password")||v->valuestring[0])snprintf(item.second,limit,"%s",v->valuestring);}}
+auto c=std::unique_ptr<Config>(new(std::nothrow)Config);if(!c){cJSON_Delete(j);return reply(r,503,"Za malo pamieci.");}{MqttLock mguard;*c=desired;}char previous_uri[181];snprintf(previous_uri,sizeof(previous_uri),"%s",c->uri);bool valid=cJSON_IsBool(cJSON_GetObjectItem(j,"enabled"));c->enabled=cJSON_IsTrue(cJSON_GetObjectItem(j,"enabled"));for(auto item:{std::pair<const char*,char*>{"uri",c->uri},{"user",c->user},{"password",c->password},{"ca",c->ca}}){auto *v=cJSON_GetObjectItem(j,item.first);size_t limit=!strcmp(item.first,"uri")?sizeof(c->uri):!strcmp(item.first,"user")?sizeof(c->user):!strcmp(item.first,"password")?sizeof(c->password):sizeof(c->ca);if(v){if(!cJSON_IsString(v)||strlen(v->valuestring)>=limit)valid=false;else if(strcmp(item.first,"password")||v->valuestring[0])snprintf(item.second,limit,"%s",v->valuestring);}}
  auto *new_password=cJSON_GetObjectItem(j,"password");if(strcmp(previous_uri,c->uri)&&(!cJSON_IsString(new_password)||!new_password->valuestring[0]))c->password[0]=0;
  cJSON_Delete(j);if(c->enabled&&!uri_valid(c->uri))valid=false;if(!valid){memset(static_cast<void*>(c.get()),0,sizeof(Config));return reply(r,400,"Niepoprawny adres lub pola MQTT. Hasla nie umieszczaj w adresie URI.");}
  auto *store=cJSON_CreateObject();if(!store){return reply(r,503,"Za malo pamieci.");}
-cJSON_AddBoolToObject(store,"enabled",c->enabled);cJSON_AddStringToObject(store,"uri",c->uri);cJSON_AddStringToObject(store,"user",c->user);cJSON_AddStringToObject(store,"password",c->password);cJSON_AddStringToObject(store,"ca",c->ca);char *text=cJSON_PrintUnformatted(store);cJSON_Delete(store);nvs_handle_t h;esp_err_t e=ESP_FAIL;if(text&&nvs_open("m2s_mqtt",NVS_READWRITE,&h)==ESP_OK){e=nvs_set_str(h,"config",text);if(e==ESP_OK)e=nvs_commit(h);nvs_close(h);}if(text){memset(text,0,strlen(text));cJSON_free(text);}if(e==ESP_OK){portENTER_CRITICAL(&lock);desired=*c;++generation;portEXIT_CRITICAL(&lock);}memset(static_cast<void*>(c.get()),0,sizeof(Config));return reply(r,e==ESP_OK?200:500,e==ESP_OK?"Ustawienia MQTT zapisane. Bramka polaczy sie bez restartu.":"Nie zapisano konfiguracji MQTT.");}
+cJSON_AddBoolToObject(store,"enabled",c->enabled);cJSON_AddStringToObject(store,"uri",c->uri);cJSON_AddStringToObject(store,"user",c->user);cJSON_AddStringToObject(store,"password",c->password);cJSON_AddStringToObject(store,"ca",c->ca);char *text=cJSON_PrintUnformatted(store);cJSON_Delete(store);nvs_handle_t h;esp_err_t e=ESP_FAIL;if(text&&nvs_open("m2s_mqtt",NVS_READWRITE,&h)==ESP_OK){e=nvs_set_str(h,"config",text);if(e==ESP_OK)e=nvs_commit(h);nvs_close(h);}if(text){memset(text,0,strlen(text));cJSON_free(text);}if(e==ESP_OK){MqttLock mguard;desired=*c;++generation;}memset(static_cast<void*>(c.get()),0,sizeof(Config));return reply(r,e==ESP_OK?200:500,e==ESP_OK?"Ustawienia MQTT zapisane. Bramka polaczy sie bez restartu.":"Nie zapisano konfiguracji MQTT.");}
 void mqtt_tick(){Command command;while(commands&&xQueueReceive(commands,&command,0)==pdTRUE){if(command.from_mqtt&&!connected.load())continue;
  const auto result=quick_add_pairing_busy()?ESP_ERR_INVALID_STATE:supla_bridge_mqtt_command(command.node,command.ep,command.on,!command.from_supla);
  if(!command.from_mqtt) {
   const char *origin = command.from_supla ? "SUPLA" : "WebUI";
   if(result==ESP_OK)ESP_LOGI("gateway_relay","%s OnOff=%d submitted to Matter (node %llu, ep %u)",origin,command.on,static_cast<unsigned long long>(command.node),static_cast<unsigned>(command.ep));
   else ESP_LOGW("gateway_relay","%s OnOff=%d rejected before completion (node %llu, ep %u): %s",origin,command.on,static_cast<unsigned long long>(command.node),static_cast<unsigned>(command.ep),esp_err_to_name(result));
- }}uint32_t gen;portENTER_CRITICAL(&lock);gen=generation;portEXIT_CRITICAL(&lock);if(gen!=applied){if(client){publish(availability,"offline");esp_mqtt_client_stop(client);esp_mqtt_client_destroy(client);client=nullptr;connected=false;}portENTER_CRITICAL(&lock);running=desired;applied=gen;portEXIT_CRITICAL(&lock);if(running.enabled){esp_mqtt_client_config_t c{};c.broker.address.uri=running.uri;c.credentials.username=running.user;c.credentials.authentication.password=running.password;c.session.last_will.topic=availability;c.session.last_will.msg="offline";c.session.last_will.qos=1;c.session.last_will.retain=1;c.outbox.limit=65536;if(!strncmp(running.uri,"mqtts://",8)){if(running.ca[0])c.broker.verification.certificate=running.ca;else c.broker.verification.crt_bundle_attach=esp_crt_bundle_attach;}client=esp_mqtt_client_init(&c);if(client){esp_mqtt_client_register_event(client,MQTT_EVENT_ANY,event,nullptr);esp_mqtt_client_start(client);}}}
+ }}uint32_t gen;{MqttLock mguard;gen=generation;}if(gen!=applied){if(client){publish(availability,"offline");esp_mqtt_client_stop(client);esp_mqtt_client_destroy(client);client=nullptr;connected=false;}{MqttLock mguard;running=desired;applied=gen;}if(running.enabled){esp_mqtt_client_config_t c{};c.broker.address.uri=running.uri;c.credentials.username=running.user;c.credentials.authentication.password=running.password;c.session.last_will.topic=availability;c.session.last_will.msg="offline";c.session.last_will.qos=1;c.session.last_will.retain=1;c.outbox.limit=65536;if(!strncmp(running.uri,"mqtts://",8)){if(running.ca[0])c.broker.verification.certificate=running.ca;else c.broker.verification.crt_bundle_attach=esp_crt_bundle_attach;}client=esp_mqtt_client_init(&c);if(client){esp_mqtt_client_register_event(client,MQTT_EVENT_ANY,event,nullptr);esp_mqtt_client_start(client);}}}
  if(!client||!connected.load()){return;}
 if(rediscover.exchange(false)){for(auto &t:tracked){t.config_hash=0;t.last_publish=0;}publish(availability,"online");}
  for(auto &t:tracked){t.seen=false;}
- uint64_t nodes[32];unsigned count=quick_add_devices_copy(nodes,32);auto readings=std::unique_ptr<device_telemetry::Reading[]>(new(std::nothrow)device_telemetry::Reading[128]);if(!readings)return;const int64_t now=esp_timer_get_time();
- for(unsigned i=0;i<count;++i){device_telemetry::Contact contact;bool truncated=false;size_t n=device_telemetry::copy(nodes[i],readings.get(),128,contact,truncated);char name[40]{};quick_add_device_name_copy(nodes[i],name,sizeof(name));
+ uint64_t nodes[kMaxNodes];unsigned count=quick_add_devices_copy(nodes,kMaxNodes);auto readings=std::unique_ptr<device_telemetry::Reading[]>(new(std::nothrow)device_telemetry::Reading[kMaxTracked]);if(!readings)return;const int64_t now=esp_timer_get_time();
+ for(unsigned i=0;i<count;++i){device_telemetry::Contact contact;bool truncated=false;size_t n=device_telemetry::copy(nodes[i],readings.get(),kMaxTracked,contact,truncated);char name[40]{};quick_add_device_name_copy(nodes[i],name,sizeof(name));
   for(size_t k=0;k<n;++k){const auto &r=readings[k];unsigned metric=(unsigned)r.metric;if(metric>=sizeof(descriptions)/sizeof(descriptions[0]))continue;auto *t=track(r);if(!t)continue;t->seen=true;const auto &d=descriptions[metric];char topic[160],available[180],state[180],cfg_topic[160];snprintf(topic,sizeof(topic),"%s/node/%llu/ep/%u/%s",base,(unsigned long long)r.node,r.endpoint,d.key);snprintf(available,sizeof(available),"%s/availability",topic);snprintf(state,sizeof(state),"%s/state",topic);
    // Only build and serialize cJSON discovery payload when fast input hash changes.
    const uint32_t fast_hash = compute_discovery_hash(r.node, r.endpoint, metric, name, base);

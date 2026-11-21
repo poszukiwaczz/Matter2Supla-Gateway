@@ -13,9 +13,14 @@
    - Oryginalny kod firmware na dysku `K:` pozostał w 100% nietknięty.
 
 2. **Pliki do wgrania (`M:\Matter2Supla-Gemini-Version\do-wgrania\`):**
-   - `Matter2Supla-0.3.3-gemini3-S3-N16R8-OTA.m2s` — podpisany pakiet OTA ECDSA (ESP32-S3)
-   - `Matter2Supla-0.3.3-gemini3-S3-N16R8-USB-UPDATE-0x10000.bin` — obraz aplikacji S3 (`ota_0`/`ota_1`)
-   - `Matter2Supla-0.3.3-gemini3-S3-N16R8-FACTORY.bin` — pełny obraz fabryczny `0x0`
+   - **Nowe wydanie `0.4.0-scale64` (`FW_BUILD 40001`, gotowe do wgrania — nie wgrane jeszcze na fizyczną S3):**
+     - `Matter2Supla-0.4.0-scale64-S3-N16R8-OTA.m2s` — podpisany pakiet OTA ECDSA (skalowanie do 64 urządzeń / 256 pomiarów, pule CHIP w PSRAM, muteksy FreeRTOS zamiast spinlocków)
+     - `Matter2Supla-0.4.0-scale64-S3-N16R8-USB-UPDATE-0x10000.bin` — obraz aplikacji S3 (`ota_0`/`ota_1`)
+     - `Matter2Supla-0.4.0-scale64-S3-N16R8-FACTORY.bin` — pełny obraz fabryczny `0x0`
+   - **Aktualnie wgrane i zweryfikowane sprzętowo na S3 (`0.3.3-gemini3`, `FW_BUILD 30303`):**
+     - `Matter2Supla-0.3.3-gemini3-S3-N16R8-OTA.m2s`
+     - `Matter2Supla-0.3.3-gemini3-S3-N16R8-USB-UPDATE-0x10000.bin`
+     - `Matter2Supla-0.3.3-gemini3-S3-N16R8-FACTORY.bin`
    - `Matter2Supla-Finder-Android.apk` — natywna aplikacja Android `v1.1.0`
    - `SHA256SUMS.txt` — sumy kontrolne SHA-256
    - Kopia powrotna binarek Codexa `0.3.2-beta4` (`30203`) znajduje się w `M:\Matter2Supla-Gemini-Version\do-wgrania\powrot-do-codex-beta4\`.

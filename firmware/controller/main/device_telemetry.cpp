@@ -8,6 +8,7 @@
 #include <esp_openthread_lock.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/portmacro.h>
+#include <freertos/semphr.h>
 #include <esp_matter.h>
 #include <platform/CHIPDeviceLayer.h>
 #include <esp_matter_controller_client.h>
@@ -24,65 +25,75 @@
 #include <new>
 namespace device_telemetry {
 namespace {
-constexpr size_t kSamples=128,kNodes=32; // Keep spinlock-guarded tables in fast internal SRAM so IRQ-off critical sections stay sub-microsecond.
-Reading readings[kSamples];
-Contact contacts[kNodes];
+constexpr size_t kSamples=256,kNodes=64; // Scale64: stored in PSRAM and guarded by a FreeRTOS mutex (never disables IRQs).
+EXT_RAM_BSS_ATTR Reading readings[kSamples];
+EXT_RAM_BSS_ATTR Contact contacts[kNodes];
 bool overflow=false;
-portMUX_TYPE guard=portMUX_INITIALIZER_UNLOCKED;
+StaticSemaphore_t guard_storage;
+SemaphoreHandle_t guard_handle=nullptr;
+portMUX_TYPE guard_init_mux=portMUX_INITIALIZER_UNLOCKED;
+struct TelemetryLock {
+ TelemetryLock() {
+  if(!guard_handle) {
+   portENTER_CRITICAL(&guard_init_mux);
+   if(!guard_handle)guard_handle=xSemaphoreCreateMutexStatic(&guard_storage);
+   portEXIT_CRITICAL(&guard_init_mux);
+  }
+  xSemaphoreTake(guard_handle,portMAX_DELAY);
+ }
+ ~TelemetryLock(){xSemaphoreGive(guard_handle);}
+};
 Contact *contact(uint64_t node) {
  for(auto &c:contacts)if(c.node==node)return &c;
- for(auto &c:contacts)if(!c.node){c.node=node;return &c;}
+ for(auto &c:contacts)if(!c.node){c={};c.node=node;return &c;}
  overflow=true;return nullptr;
 }
 Reading *reading(uint64_t node,uint16_t ep,Metric metric) {
  for(auto &r:readings)if(r.node==node && r.endpoint==ep && r.metric==metric)return &r;
- for(auto &r:readings)if(!r.node){r.node=node;r.endpoint=ep;r.metric=metric;return &r;}
+ for(auto &r:readings)if(!r.node){r={};r.node=node;r.endpoint=ep;r.metric=metric;r.channel=-1;return &r;}
  overflow=true;return nullptr;
 }
 }
 bool lookup(uint64_t node,uint16_t ep,Metric metric,Reading &out) {
- bool found=false;portENTER_CRITICAL(&guard);
+ bool found=false;TelemetryLock lock;
  for(const auto &r:readings)if(r.node==node&&r.endpoint==ep&&r.metric==metric){out=r;found=true;break;}
- portEXIT_CRITICAL(&guard);return found;
+ return found;
 }
 void observe(uint64_t node,uint16_t ep,Metric metric,bool valid,int64_t raw,Source source) {
  if(!node)return;
  const int64_t now=esp_timer_get_time();
- portENTER_CRITICAL(&guard);
+ TelemetryLock lock;
  if(auto *r=reading(node,ep,metric)) {
   if(!r->received || r->valid!=valid || (valid && r->raw!=raw))r->changed=now;
   r->valid=valid;r->raw=raw;r->received=now;r->source=source;
  }
- portEXIT_CRITICAL(&guard);
 }
 void applied(uint64_t node,uint16_t ep,Metric metric,bool valid,int64_t raw,int channel) {
- portENTER_CRITICAL(&guard);
+ TelemetryLock lock;
  for(auto &r:readings)if(r.node==node && r.endpoint==ep && r.metric==metric && r.valid==valid && (!valid || r.raw==raw)) {
   r.applied=esp_timer_get_time();r.channel=channel;break;
  }
- portEXIT_CRITICAL(&guard);
 }
 void subscription(uint64_t node,bool active) {
- portENTER_CRITICAL(&guard);if(auto *c=contact(node))c->active=active;portEXIT_CRITICAL(&guard);
+ TelemetryLock lock;if(auto *c=contact(node))c->active=active;
 }
 void report(uint64_t node) {
- portENTER_CRITICAL(&guard);if(auto *c=contact(node)){c->report=esp_timer_get_time();++c->reports;}portEXIT_CRITICAL(&guard);
+ TelemetryLock lock;if(auto *c=contact(node)){c->report=esp_timer_get_time();++c->reports;}
 }
 void intervals(uint64_t node,uint16_t minimum,uint16_t maximum) {
- portENTER_CRITICAL(&guard);if(auto *c=contact(node)){c->minimum=minimum;c->maximum=maximum;}portEXIT_CRITICAL(&guard);
+ TelemetryLock lock;if(auto *c=contact(node)){c->minimum=minimum;c->maximum=maximum;}
 }
 void forget(uint64_t node) {
- portENTER_CRITICAL(&guard);
+ TelemetryLock lock;
  for(auto &r:readings)if(r.node==node)r={};
  for(auto &c:contacts)if(c.node==node)c={};
- portEXIT_CRITICAL(&guard);
 }
 size_t copy(uint64_t node,Reading *out,size_t capacity,Contact &c,bool &truncated) {
  size_t count=0;c={};
- portENTER_CRITICAL(&guard);truncated=overflow;
+ TelemetryLock lock;truncated=overflow;
  for(const auto &r:readings)if(r.node==node){if(count<capacity)out[count++]=r;else truncated=true;}
  for(const auto &v:contacts)if(v.node==node)c=v;
- portEXIT_CRITICAL(&guard);return count;
+ return count;
 }
 
 namespace {

@@ -31,7 +31,7 @@ if(!digest(check.get(),p->size,h.sha)){return reply(req,500,"Blad SHA256. Kopia 
 if(mbedtls_base64_encode(encoded.get(),length+1,&length,image.get(),bytes)){return reply(req,500,"Blad kodowania.");}
 encoded[length]=0;
  auto *j=cJSON_CreateObject();if(!j){return ESP_ERR_NO_MEM;}
-cJSON_AddBoolToObject(j,"ok",true);cJSON_AddNumberToObject(j,"format",3);cJSON_AddStringToObject(j,"image",(char*)encoded.get());cJSON_AddStringToObject(j,"target","Same S3, same SUPLA identity; NVS with Matter fabrics, Thread and secrets");uint64_t nodes[32];cJSON_AddNumberToObject(j,"devices",quick_add_devices_copy(nodes,32));char *text=cJSON_PrintUnformatted(j);cJSON_Delete(j);memset(image.get(),0,bytes);memset(check.get(),0,p->size);if(!text){return ESP_ERR_NO_MEM;}
+cJSON_AddBoolToObject(j,"ok",true);cJSON_AddNumberToObject(j,"format",3);cJSON_AddStringToObject(j,"image",(char*)encoded.get());cJSON_AddStringToObject(j,"target","Same S3, same SUPLA identity; NVS with Matter fabrics, Thread and secrets");uint64_t nodes[64];cJSON_AddNumberToObject(j,"devices",quick_add_devices_copy(nodes,64));char *text=cJSON_PrintUnformatted(j);cJSON_Delete(j);memset(image.get(),0,bytes);memset(check.get(),0,p->size);if(!text){return ESP_ERR_NO_MEM;}
 httpd_resp_set_type(req,"application/json");httpd_resp_set_hdr(req,"Cache-Control","no-store");auto e=httpd_resp_sendstr(req,text);memset(text,0,strlen(text));cJSON_free(text);return e;}
 esp_err_t restore(httpd_req_t *req){Lease lease;if(!lease.owned||quick_add_pairing_busy()){return reply(req,409,"Bramka jest zajeta.");}
 const auto *stage=stage_part(),*original=nvs_part();if(!stage||!original||original->size!=kNvsBytes||original->encrypted){return reply(req,409,"Najpierw wymagana jest migracja partycji do wydania0.3.");}
