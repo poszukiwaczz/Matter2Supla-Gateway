@@ -1,32 +1,33 @@
-# TODO — Matter2Supla (Przekazanie dla Codex / kolejne kroki)
+# TODO — Matter2Supla (Stan na 21.11.2026)
 
-## 1. Weryfikacja sprzętowa wydania `0.3.3-gemini1` (Build `30301`)
-- [ ] **Decyzja użytkownika o wgraniu `0.3.3-gemini1`:**
-  - Obraz OTA `.m2s` (`M:\Matter2Supla-Gemini-Version\do-wgrania\Matter2Supla-0.3.3-gemini1-S3-N16R8-OTA.m2s`) lub obraz aplikacji USB `0x10000` nie był jeszcze wgrywany na fizyczną płytkę S3.
-  - Przed wgraniem przez USB wykonać pełny backup NVS/PHY/otadata; przy wgraniu przez OTA z panelu obecna wersja `0.3.2-beta4` (`30203`) pozostanie w slocie `ota_0` jako gotowy obraz powrotny (`VALID`).
-- [ ] **Pomiar zysku pamięci wewnętrznej DRAM na fizycznym S3 po starcie `0.3.3-gemini1`:**
-  - Sprawdzić w `/api/gateway/diagnostics` (lub w zakładce Diagnostyka aplikacji Android) wzrost `memory.internal_free` oraz `memory.internal_minimum` po przeniesieniu tablic `device_telemetry` i `gateway_mqtt` do PSRAM (oczekiwany wzrost o ok. +25–28 KiB względem ~66 KiB w `beta4`).
-- [ ] **Weryfikacja mDNS i Watchdoga subskrypcji na żywo:**
-  - Potwierdzić dostępność `https://matter2supla.local/` oraz wykrywanie usługi `_matter2supla._tcp` w aplikacji Android.
-  - Potwierdzić zachowanie `BridgeSubscription` (limit 3 prób `DefaultResubscribePolicy` + 180 s Zombie Watchdog) przy wymuszonym uśpieniu/wybudzeniu czujnika TIMMERFLOTTE i gniazdka GRILLPLATS.
+## 1. Weryfikacja sprzętowa wydania `0.4.0-scale64` (Build `40002`)
+- [ ] **Decyzja użytkownika i wgranie `0.4.0-scale64` (Build `40002`) na fizyczną S3 (`COM16` / `192.168.1.191`):**
+  - Gotowy podpisany pakiet OTA: `M:\Matter2Supla-Gemini-Version\do-wgrania\Matter2Supla-0.4.0-scale64-S3-N16R8-OTA.m2s` (SHA-256: `0a45d9ada5dc50f0e4be026a7f619724616af1707a57af4cfad7c5c5fa767708`).
+  - Przy wgraniu przez USB (`ota_1` pod `0x8b0000`) lub przez OTA zachować nienaruszone `ota_0` (`0.3.2-beta4` / `30203`) jako obraz powrotny (`Rollback`).
+- [ ] **Pomiar wewnętrznego SRAM, PSRAM i CPU po starcie `0.4.0-scale64`:**
+  - Zweryfikować w `/api/gateway/diagnostics` zysk wolnego wewnętrznego SRAM (`internal_free`, `internal_minimum`) po włączeniu `CONFIG_CHIP_MEM_ALLOC_MODE_EXTERNAL=y` + `CONFIG_CHIP_SYSTEM_CONFIG_POOL_USE_HEAP=y` oraz przeniesieniu `readings[256]` do PSRAM z muteksami `DRAM_ATTR`.
+  - Potwierdzić zatwierdzenie obrazu przez naprawione `ota_health(s3_healthy, c6_ready)` po 90 s (`OTA image confirmed VALID at 90s`), `SUPLA 17`, aktywne subskrypcje `TIMMERFLOTTE` (node 6) i `GRILLPLATS` (node 10), `wifi_health.disconnects == 0` oraz stabilne CPU ~10–20%.
+- [ ] **Opublikowanie oficjalnego Release `v0.4.0-scale64` na GitHubie (opcjonalnie):**
+  - Załączyć paczki `OTA.m2s`, `USB-UPDATE-0x10000.bin`, `FACTORY.bin`, `Matter2Supla-Finder-Android.apk` oraz `SHA256SUMS.txt` w zakładce Releases repozytorium `poszukiwaczz/Matter2Supla-Gemini`.
 
-## 2. Diagnostyka sprzętowa radia ESP32-C6 (CCA −70 dBm)
-- [ ] **Separacja fizyczna i zasilanie płytki C6:**
-  - Płaski poziom ok. −70 dBm na wszystkich kanałach 11–26 podczas wcześniejszej awarii CCA oraz fakt, że pomógł dopiero power-cycle C6 (a nie sam reset EN), wskazują na czynnik sprzętowy/zasilaniowy lub sprzężenie z anteną Wi-Fi S3.
-  - Sprawdzić odsunięcie płytki C6 od anteny S3 (>10–15 cm) oraz stabilność linii zasilania 5 V / 3,3 V.
-- [ ] **Opcjonalny sprzętowy klucz zasilania C6 (MOSFET sterowany z GPIO S3):**
-  - Jeśli blokada CCA na C6 kiedykolwiek powróci, podłączyć sterowanie zasilaniem C6 do wolnego GPIO S3 i spiąć je z dodaną w `0.3.3-gemini1` flagą `radio.watchdog_alert` (`consecutive_cca_blocked >= 3 || consecutive_failed >= 3`), aby S3 mogła automatycznie wykonać power-cycle C6 (z limitem np. 1 raz na 15 min).
+## 2. Zdalna aktualizacja ESP32-C6 (przed montażem w docelowym miejscu)
+- [ ] **Wybór architektury połączenia S3 ↔ C6 w docelowej obudowie:**
+  - **Wariant B (jeden kabelek USB-C ↔ USB-C ze zlutowaną zworką `USB-OTG` na S3):**
+    - Zlutować pady `USB-OTG` na spodzie S3, zasilić S3 przez port `COM` (zasilacz 5 V / min. 1,5–2 A) i potwierdzić zasilanie C6 przez jeden kabelek USB-C ↔ USB-C.
+    - Zaprojektować i wdrożyć **2×OTA + automatyczny rollback na ESP32-C6** (tablica partycji `ota_0`/`ota_1` po 1,5 MB na 4 MB Flash C6 + odbiornik OTA po istniejącym `UART1` `GPIO19/20 ↔ GPIO12/13` + endpoint `POST /api/gateway/update-rcp` w S3 korzystający z partycji `rcp_fw` 600 KB i podpisu ECDSA).
+    - Jednorazowo wgrać bazowy obraz 2×OTA na C6 po USB przed zamknięciem obudowy.
+  - **Alternatywnie — Wariant A (6 przewodów: 5V/GND + UART0 `GPIO16/17` + `EN` + `BOOT/GPIO9`):**
+    - Włączyć oficjalny `esp_rcp_update` z krzemowego ROM bootloadera C6 oraz dodać sprzętowy reset C6 z pinu `EN` podpięty do `watchdog_alert` w `gateway_services.cpp`.
 
-## 3. Aplikacja Android (`android-app/`)
-- [ ] **Test terenowy wersji `1.1.0` (`LIVE` 2,5 s + skaner QR + poprawiona Diagnostyka):**
-  - Potwierdzić na telefonie płynność automatycznego odświeżania co 2,5 s, skanowanie kodu QR `MT:...` aparatem oraz brak pustego miejsca w pierwszej karcie Diagnostyki.
-- [ ] **Rozbudowa o zakładkę Ustawienia / OTA (opcjonalnie w `v1.2.0`):**
-  - Dodać możliwość zmiany nazwy bramki, kanału Thread, pobrania kopii zapasowej oraz bezpośredniego przesłania pliku `.m2s` (OTA) i przycisku **Rollback** z poziomu natywnej aplikacji Android.
+## 3. Dalszy rozwój aplikacji Android (`Matter2Supla Finder`)
+- [ ] **Test zaktualizowanego APK na telefonie (`Matter2Supla-Finder-Android.apk`):**
+  - Sprawdzić wielogodzinną stabilność z otwartym podglądem `LIVE` (5 s, Keep-Alive + `requestMutex`), sterowanie przekaźnikiem oraz skaner QR.
+- [ ] **Wersja `v1.2.0` (opcjonalnie):**
+  - Dodać zakładkę *Ustawienia i Aktualizacje*: zdalne wgrywanie `.m2s` (S3 i C6), przycisk **Rollback**, pobieranie kopii NVS oraz zmianę nazwy bramki / kanału Thread z aplikacji.
 
 ## 4. Procedura awaryjnego powrotu do `0.3.2-beta4` (Codex)
-- Wszystkie oryginalne, zweryfikowane binarki Codexa `0.3.2-beta4` (`30203`) są zabezpieczone w dwóch miejscach:
+- Oryginalne, zweryfikowane binarki Codexa `0.3.2-beta4` (`30203`) są zabezpieczone w:
   1. `K:\AI PROJEKTY\matter2supla\beta\0.3.2-beta4-dev\build-artifacts\s3\`
   2. `M:\Matter2Supla-Gemini-Version\do-wgrania\powrot-do-codex-beta4\`
-- Sposoby powrotu:
-  - **Bez kabla (po wgraniu przez OTA):** użyć przycisku **Przywróć poprzednią wersję (Rollback)** w panelu WebUI (`POST /api/gateway/rollback` z `{"confirm":"ROLLBACK"}`) — przełącza boot z powrotem na slot `ota_0` z `0.3.2-beta4`.
-  - **Przez kabel USB (COM16):** wgrać `s3-n16r8-controller-app.bin` z `powrot-do-codex-beta4` pod adres aktywnego slotu aplikacji (`0x10000` dla `ota_0`), bez ruszania tablicy partycji, NVS, mapy kanałów i tożsamości SUPLA.
+- **Powrót bez kabla:** przycisk *Przywróć poprzednią wersję (Rollback)* w WebUI (`POST /api/gateway/rollback`, `{"confirm":"ROLLBACK"}`) — wraca do `ota_0` (`0.3.2-beta4`) bez ruszania NVS i urządzeń (o ile sparowanych jest `<= 32` urządzeń).
+- **Powrót przez USB (`COM16`):** wgranie `s3-n16r8-controller-app.bin` z `powrot-do-codex-beta4` do aktywnego slotu aplikacji bez modyfikacji tablicy partycji i NVS.

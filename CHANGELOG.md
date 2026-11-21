@@ -30,7 +30,7 @@
 ### 2. Zamiana spinlocków na muteksy FreeRTOS i podwojenie tablic w PSRAM
 - **`device_telemetry.cpp`:** `kNodes` `32` → **`64`**, `kSamples` `128` → **`256`**; `readings[256]`, `contacts[64]` i `thread_peers[64]` w PSRAM (`EXT_RAM_BSS_ATTR`), chronione przez zwykły muteks FreeRTOS (`TelemetryLock` bez wyłączania przerwań CPU).
 - **`gateway_mqtt.cpp`:** `tracked` `128` → **`256`**, `nodes` `32` → **`64`**, `desired`/`running`/`tracked` w PSRAM chronione przez muteks FreeRTOS (`MqttLock`).
-- **`quick_add.cpp`:** `MAX_DEVICES` `32` → **`64`** z pełną kompatybilnością wsteczną i powrotną NVS (`registry_v1` zachowuje 32-elementowy format binarny dla bezpiecznego rollbacku do `0.3.2`/`0.3.3`, a powyżej 32 urządzeń zapisywany jest pełny `registry_v2`). Zoptymalizowano też `log_hook()` i `log_tail()` przez dwuetapowy `memcpy()` zamiast pętli bajt po bajcie pod spinlockiem.
+- **`quick_add.cpp`:** `MAX_DEVICES` `32` → **`64`** z pełną kompatybilnością wsteczną i powrotną NVS (`registry_v1` dla `<= 32` urządzeń zachowuje 32-elementowy format binarny dla bezpiecznego rollbacku do `0.3.2`/`0.3.3`; powyżej 32 urządzeń zapisywany jest kompaktowy `registry_v2`). Zoptymalizowano też `log_hook()` i `log_tail()` przez dwuetapowy `memcpy()` zamiast pętli bajt po bajcie pod spinlockiem.
 - **`supla_bridge.cpp`, `matter_ota.cpp`, `gateway_recovery.cpp`:** `kMaxSlots`, `s_reporting`, `s_reporting_live`, `states`, `nodes` powiększone z `32` → **`64`**, pula `s_reads` z `8` → **`16`**.
 - **Adaptacyjne tempo subskrypcji i dynamiczne `MinInterval` (`supla_bridge.cpp`):**
   - `MinInterval` ustawiany automatycznie: `0 s` dla `<= 8` urządzeń, `2 s` dla `9–24` urządzeń, `5 s` dla `25–64` urządzeń.
@@ -39,6 +39,9 @@
 ---
 
 ## 2026-11-21 — `0.3.3-gemini3` (Build `30303`) — Audyt końcowy i poprawki brzegowe
+
+### 0. Weryfikacja długotrwała na żywym sprzęcie (`uptime = 7898 s` / 2 godz. 11 min)
+- Potwierdzono **0 B wycieku RAM** (`internal_free: 64 383 B`, `psram_free: 7,85 MB`), `wifi_health.disconnects: 0`, `radio_cca_total: 1` na `3504` transmisje, `probe_failures: 0`, `panic_count: 0`, `TIMMERFLOTTE`: `27` raportów bez przerw, `GRILLPLATS`: `2140` raportów.
 
 ### 1. Poprawki firmware `0.3.3-gemini3` (`FW_BUILD 30303`)
 - **Synchronizacja cache skanu Wi-Fi (`wifi_manager.cpp`):**
