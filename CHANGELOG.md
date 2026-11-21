@@ -1,6 +1,20 @@
 # Changelog — Matter2Supla (Gemini Version + Android App)
 
-## 2026-11-21 — `0.4.0-scale64` (Build `40001`) — Skalowanie bramki do 64 urządzeń Matter / 256 pomiarów
+## 2026-11-21 — `0.4.0-scale64` (Build `40002`) — Skalowanie do 64 urządzeń + 7 poprawek z pełnego audytu kodu
+
+### 0. Poprawki po audycie kodu `0.3.3` i `0.4.0` (Build `40002`)
+- **Stos `httpd` i kompaktowe NVS (`quick_add.cpp`):**
+  - Przeniesiono `DeviceRegistry snapshot` (`3592 B`) w `send_devices()` ze stosu zadania `httpd` na stertę (`std::unique_ptr`), eliminując ryzyko przepełnienia stosu podczas `/api/devices`.
+  - Zapis `registry_v2` powyżej 32 urządzeń zapisuje wyłącznie aktywne wpisy (`8 + count * 56 B`) i usuwa duplikat `registry_v1`, chroniąc 24 KiB partycję `nvs` przed `ESP_ERR_NVS_NOT_ENOUGH_SPACE` (dla `<= 32` urządzeń zachowano 100% wstecznie zgodny `registry_v1`).
+- **Naprawa automatycznego rollbacku OTA i watchdoga C6 (`gateway_update.cpp`, `gateway_services.cpp`):**
+  - Rozdzielono `ota_health(bool s3_healthy, bool c6_ready)`: zatwierdzenie po 90 s przy zdrowym S3 i C6, po 180 s przy zdrowym samym S3 (`internal_free > 16 KiB`), a po **240 s automatyczny rollback** (`esp_ota_mark_app_invalid_rollback_and_reboot()`), jeśli samo S3 nie przechodzi kontroli zdrowia.
+  - Przywrócono logi diagnostyczne `gateway_ota` oraz zliczanie timeoutu muteksu OpenThread w `r.failed` / `r.consecutive_failed`.
+- **Natywne muteksy `S32C1I` w wewnętrznym DRAM i lżejsze `/api/devices` (`device_telemetry.cpp`, `gateway_mqtt.cpp`, `quick_add.cpp`):**
+  - Dodano `DRAM_ATTR` na `guard_storage`, `lock_storage`, `s_devices_mutex_storage` i `s_devices_writer_storage` (potwierdzone w `.dram1` pod `0x3fca2798`–`0x3fca28ac`).
+  - Zmniejszono tymczasowy bufor per-urządzenie w `device_telemetry::append_json()` z `256` na `32` wpisy (`1,8 KiB` zamiast `14,3 KiB` na węzeł).
+- **Przywrócenie utraconych poprawek w `sdkconfig` i `supla_bridge.cpp`:**
+  - Przywrócono `CONFIG_LWIP_MAX_SOCKETS=16` i wyłączono `CONFIG_ENABLE_PERSIST_SUBSCRIPTIONS` (oszczędność miejsca w 24 KiB NVS i Flash).
+  - Przywrócono niezależny `ensure_poll_task_started()` (`Opus N2`), straż atomową `s_starting`, kolejkę aktualizacji `kQueueCapacity = 192` oraz alokację `ChannelMap` na stercie w `supla_bridge_max_reserved_node()`.
 
 ### 1. Zdjęcie ukrytych barier w stosie Matter (CHIP) i OpenThread (`matter_project_config.h`, `sdkconfig`)
 - **Kontroler Matter (`matter_project_config.h`):**

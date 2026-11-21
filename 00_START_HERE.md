@@ -13,7 +13,7 @@
    - Oryginalny kod firmware na dysku `K:` pozostał w 100% nietknięty.
 
 2. **Pliki do wgrania (`M:\Matter2Supla-Gemini-Version\do-wgrania\`):**
-   - **Nowe wydanie `0.4.0-scale64` (`FW_BUILD 40001`, gotowe do wgrania — nie wgrane jeszcze na fizyczną S3):**
+   - **Nowe wydanie `0.4.0-scale64` (`FW_BUILD 40002`, po audycie kodu — gotowe do wgrania, nie wgrane jeszcze na fizyczną S3):**
      - `Matter2Supla-0.4.0-scale64-S3-N16R8-OTA.m2s` — podpisany pakiet OTA ECDSA (skalowanie do 64 urządzeń / 256 pomiarów, pule CHIP w PSRAM, muteksy FreeRTOS zamiast spinlocków)
      - `Matter2Supla-0.4.0-scale64-S3-N16R8-USB-UPDATE-0x10000.bin` — obraz aplikacji S3 (`ota_0`/`ota_1`)
      - `Matter2Supla-0.4.0-scale64-S3-N16R8-FACTORY.bin` — pełny obraz fabryczny `0x0`

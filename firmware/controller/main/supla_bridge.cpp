@@ -78,6 +78,8 @@ extern const uint8_t supla_org_cert_pem_start[] asm("_binary_supla_org_cert_pem_
 extern const uint8_t supla_3rd_cert_pem_start[] asm("_binary_supla_3rd_cert_pem_start");
 
 static std::atomic<bool> s_active{false};
+static std::atomic<bool> s_starting{false};
+static std::atomic<bool> s_poll_started{false};
 static std::atomic<bool> s_begin_done{false};
 static std::atomic<bool> s_reload_name{false};
 static std::atomic<int> s_status_code{STATUS_UNKNOWN};
@@ -461,7 +463,7 @@ struct Update {
   bool valid;
 };
 
-static const size_t kQueueCapacity = 96;
+static const size_t kQueueCapacity = 192;
 static Update s_queue[kQueueCapacity];
 static size_t s_queue_head = 0;
 static size_t s_queue_tail = 0;
@@ -822,24 +824,31 @@ static void poll_task(void *)
 
   size_t cursor = 0;
   for (;;) {
-    // Thread traffic and subscription recovery must not depend on Wi-Fi IP.
-    if (s_active) {
-      {esp_matter::lock::ScopedChipStackLock lock(portMAX_DELAY);release_removed_reporting();}
-      uint64_t nodes[kMaxReportingNodes];
-      size_t count = quick_add_devices_copy(nodes, sizeof(nodes) / sizeof(nodes[0]));
-      // Adaptive MinInterval: 0s for <=8 devices, 2s for 9..24 devices, 5s for 25..64 devices
-      const uint16_t min_interval_s = (count <= 8) ? 0 : (count <= 24 ? 2 : 5);
-      size_t new_subscribes_this_tick = 0;
-      if (count) cursor %= count;
-      for (size_t i = 0; i < count; ++i) {
-        bool started_new = false;
-        const bool allow_new = (new_subscribes_this_tick < kMaxNewSubscribesPerTick);
-        if (!poll_device(nodes[cursor], min_interval_s, allow_new, started_new)) break;
-        if (started_new) ++new_subscribes_this_tick;
-        cursor = (cursor + 1) % count;
-      }
+    // Matter reporting & telemetry for WebUI/Android/MQTT run regardless of SUPLA Cloud configuration.
+    {esp_matter::lock::ScopedChipStackLock lock(portMAX_DELAY);release_removed_reporting();}
+    uint64_t nodes[kMaxReportingNodes];
+    size_t count = quick_add_devices_copy(nodes, sizeof(nodes) / sizeof(nodes[0]));
+    // Adaptive MinInterval: 0s for <=8 devices, 2s for 9..24 devices, 5s for 25..64 devices
+    const uint16_t min_interval_s = (count <= 8) ? 0 : (count <= 24 ? 2 : 5);
+    size_t new_subscribes_this_tick = 0;
+    if (count) cursor %= count;
+    for (size_t i = 0; i < count; ++i) {
+      bool started_new = false;
+      const bool allow_new = (new_subscribes_this_tick < kMaxNewSubscribesPerTick);
+      if (!poll_device(nodes[cursor], min_interval_s, allow_new, started_new)) break;
+      if (started_new) ++new_subscribes_this_tick;
+      cursor = (cursor + 1) % count;
     }
     vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+
+static void ensure_poll_task_started(void)
+{
+  if (s_poll_started.exchange(true)) return;
+  if (xTaskCreate(poll_task, "supla_poll", 6144, nullptr, 4, nullptr) != pdPASS) {
+    s_poll_started.store(false);
+    ESP_LOGE(TAG, "Nie utworzono zadania odczytow Matter");
   }
 }
 
@@ -1054,9 +1063,12 @@ extern "C" void supla_bridge_request_name_reload(void)
 
 extern "C" void supla_bridge_start(void)
 {
-  if (s_active) {
+  ensure_poll_task_started();
+  if (s_active || s_starting.exchange(true)) {
     return;
   }
+  struct ClearStarting { ~ClearStarting() { s_starting.store(false); } } clear_starting;
+
   supla_config_load();
   supla_cfg_t cfg_value{};
   if(supla_config_copy(&cfg_value)!=ESP_OK){s_active=false;
@@ -1093,7 +1105,6 @@ extern "C" void supla_bridge_start(void)
     s_active = false;
     return;
   }
-  if(xTaskCreate(poll_task,"supla_poll",6144,nullptr,4,nullptr)!=pdPASS)ESP_LOGE(TAG,"Nie utworzono zadania odczytow Matter");
 
   ESP_LOGI(TAG, "Warstwa Supla uruchomiona");
 }
@@ -1132,14 +1143,15 @@ extern "C" esp_err_t supla_bridge_max_reserved_node(uint64_t *maximum) {
   esp_err_t err=nvs_open("m2s_channels",NVS_READONLY,&h);
   if(err==ESP_ERR_NVS_NOT_FOUND)return ESP_OK;
   if(err!=ESP_OK)return err;
-  ChannelMap map{};
-  size_t n=sizeof(map);
-  err=nvs_get_blob(h,"map",&map,&n);
+  auto map = std::unique_ptr<ChannelMap>(new(std::nothrow) ChannelMap{});
+  if (!map) { nvs_close(h); return ESP_ERR_NO_MEM; }
+  size_t n=sizeof(*map);
+  err=nvs_get_blob(h,"map",map.get(),&n);
   nvs_close(h);
   if(err==ESP_ERR_NVS_NOT_FOUND)return ESP_OK;
   if(err!=ESP_OK)return err;
-  if(n!=sizeof(map)||map.version!=1||map.count>64)return ESP_ERR_INVALID_STATE;
-  for(size_t i=0;i<map.count;i++)if(map.entries[i].node>*maximum)*maximum=map.entries[i].node;
+  if(n!=sizeof(*map)||map->version!=1||map->count>64)return ESP_ERR_INVALID_STATE;
+  for(size_t i=0;i<map->count;i++)if(map->entries[i].node>*maximum)*maximum=map->entries[i].node;
   return ESP_OK;
 }
 extern "C" const char *supla_bridge_state_name(void)

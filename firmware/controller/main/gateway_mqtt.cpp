@@ -25,7 +25,7 @@ namespace gateway {namespace {
 // Scale64: large MQTT config and tracking tables live in PSRAM and are guarded by a FreeRTOS mutex (no IRQ disabling).
 struct Config {bool enabled=false;char uri[181]{},user[81]{},password[129]{},ca[4097]{};};
 EXT_RAM_BSS_ATTR Config desired,running;
-StaticSemaphore_t lock_storage;
+DRAM_ATTR StaticSemaphore_t lock_storage;
 SemaphoreHandle_t lock_handle=nullptr;
 portMUX_TYPE lock_init_mux=portMUX_INITIALIZER_UNLOCKED;
 struct MqttLock {

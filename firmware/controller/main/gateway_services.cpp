@@ -159,11 +159,11 @@ void work(void*){gateway_worker.store(xTaskGetCurrentTaskHandle());int64_t next=
    if(r.result==ESP_OK){r.good=esp_timer_get_time();r.consecutive_failed=0;const char *v=otPlatRadioGetVersionString(esp_openthread_get_instance());snprintf(r.version,sizeof(r.version),"%s",v?v:"");}
    else {++r.failed;++r.consecutive_failed;}
    auto *c=otLinkGetCounters(esp_openthread_get_instance());if(c){r.tx_delta=c->mTxTotal-r.tx;r.tx=c->mTxTotal;r.cca_delta=c->mTxErrCca-r.cca;r.cca=c->mTxErrCca;r.blocked=radio_blocked(r.tx_delta,r.cca_delta);if(r.blocked)++r.consecutive_cca_blocked;else r.consecutive_cca_blocked=0;r.rx_errors=c->mRxErrFcs+c->mRxErrSec;}
-   esp_openthread_lock_release();}else r.result=ESP_ERR_TIMEOUT;
+   esp_openthread_lock_release();}else{r.result=ESP_ERR_TIMEOUT;++r.failed;++r.consecutive_failed;}
   r.watchdog_alert = (r.consecutive_cca_blocked >= 3 || r.consecutive_failed >= 3);
   static int64_t warning=0;if((r.blocked || r.watchdog_alert)&&(!warning||now-warning>=60000000)){ESP_LOGW("gateway_health","RF/C6 watchdog: TX window=%lu CCA window=%lu (consec_cca=%lu consec_fail=%lu); RCP query=%d.",(unsigned long)r.tx_delta,(unsigned long)r.cca_delta,(unsigned long)r.consecutive_cca_blocked,(unsigned long)r.consecutive_failed,r.result);warning=now;}
   portENTER_CRITICAL(&guard);radio=r;portEXIT_CRITICAL(&guard);next=now+15000000;}
- Radio r;portENTER_CRITICAL(&guard);r=radio;portEXIT_CRITICAL(&guard);ota_health(r.good&&now-r.good<45000000&&heap_caps_get_free_size(MALLOC_CAP_INTERNAL)>8192);
+ Radio r;portENTER_CRITICAL(&guard);r=radio;portEXIT_CRITICAL(&guard);ota_health(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)>16384,r.good&&now-r.good<45000000);
  mqtt_tick();ulTaskNotifyTake(pdTRUE,pdMS_TO_TICKS(2000));}}
 }
 void wake_gateway_worker()

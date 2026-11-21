@@ -25,7 +25,7 @@ esp_err_t relay_enqueue(uint64_t,uint16_t,bool,bool from_supla=false);
 void mqtt_tick();
 void wake_gateway_worker();
 void mqtt_init();
-void ota_health(bool local_ready);
+void ota_health(bool s3_healthy,bool c6_ready);
 esp_err_t reply(httpd_req_t*,int,const char*);
 cJSON* body_json(httpd_req_t*,size_t limit);
 bool mutation_busy();

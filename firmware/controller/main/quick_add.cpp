@@ -183,7 +183,7 @@ uint32_t count;
 device_entry_t entries[LEGACY_MAX_DEVICES];};
 EXT_RAM_BSS_ATTR device_entry_t s_devices[MAX_DEVICES]{};
 size_t s_devices_count=0;
-StaticSemaphore_t s_devices_mutex_storage,s_devices_writer_storage;
+DRAM_ATTR StaticSemaphore_t s_devices_mutex_storage,s_devices_writer_storage;
 SemaphoreHandle_t s_devices_mutex=nullptr,s_devices_writer=nullptr;
 struct RegistryLock {SemaphoreHandle_t lock;
 RegistryLock(SemaphoreHandle_t m):lock(m){xSemaphoreTake(lock,portMAX_DELAY);}~RegistryLock(){xSemaphoreGive(lock);}};
@@ -203,18 +203,24 @@ esp_err_t devices_persist(const DeviceRegistry &snapshot) {
     nvs_handle_t h;
     esp_err_t err=nvs_open("panel",NVS_READWRITE,&h);
     if(err!=ESP_OK)return err;
-    // Keep registry_v1 in the exact 32-entry binary layout for seamless rollback to 0.3.2/0.3.3.
-    auto legacy=std::unique_ptr<DeviceRegistryLegacy32>(new(std::nothrow)DeviceRegistryLegacy32{});
-    if(!legacy){nvs_close(h);return ESP_ERR_NO_MEM;}
-    legacy->version=1;
-    legacy->count=std::min<uint32_t>(snapshot.count,LEGACY_MAX_DEVICES);
-    memcpy(legacy->entries,snapshot.entries,legacy->count*sizeof(device_entry_t));
-    err=nvs_set_blob(h,"registry_v1",legacy.get(),sizeof(*legacy));
-    if(err==ESP_OK) {
-        if(snapshot.count>LEGACY_MAX_DEVICES) {
-            err=nvs_set_blob(h,"registry_v2",&snapshot,sizeof(snapshot));
-        } else {
+    if(snapshot.count<=LEGACY_MAX_DEVICES) {
+        // Keep exact 32-entry binary layout in registry_v1 for seamless rollback to 0.3.2/0.3.3.
+        auto legacy=std::unique_ptr<DeviceRegistryLegacy32>(new(std::nothrow)DeviceRegistryLegacy32{});
+        if(!legacy){nvs_close(h);return ESP_ERR_NO_MEM;}
+        legacy->version=1;
+        legacy->count=snapshot.count;
+        memcpy(legacy->entries,snapshot.entries,legacy->count*sizeof(device_entry_t));
+        err=nvs_set_blob(h,"registry_v1",legacy.get(),sizeof(*legacy));
+        if(err==ESP_OK) {
             esp_err_t del=nvs_erase_key(h,"registry_v2");
+            if(del!=ESP_OK&&del!=ESP_ERR_NVS_NOT_FOUND)err=del;
+        }
+    } else {
+        // Store compact blob (only active entries) in registry_v2 and drop registry_v1 to save 24 KiB NVS space.
+        const size_t compact_bytes=offsetof(DeviceRegistry,entries)+snapshot.count*sizeof(device_entry_t);
+        err=nvs_set_blob(h,"registry_v2",&snapshot,compact_bytes);
+        if(err==ESP_OK) {
+            esp_err_t del=nvs_erase_key(h,"registry_v1");
             if(del!=ESP_OK&&del!=ESP_ERR_NVS_NOT_FOUND)err=del;
         }
     }
@@ -237,7 +243,15 @@ esp_err_t devices_load() {
     if(err!=ESP_OK)return err;
     size_t n=sizeof(*snapshot);
     err=nvs_get_blob(h,"registry_v2",snapshot.get(),&n);
-    bool loaded_blob=(err==ESP_OK && n==sizeof(*snapshot));
+    const size_t header_bytes=offsetof(DeviceRegistry,entries);
+    bool loaded_blob=false;
+    if(err==ESP_OK && n>=header_bytes && n<=sizeof(*snapshot)) {
+        const size_t payload=n-header_bytes;
+        if((n==sizeof(*snapshot) && snapshot->count<=MAX_DEVICES) ||
+           (payload%sizeof(device_entry_t)==0 && snapshot->count==payload/sizeof(device_entry_t) && snapshot->count<=MAX_DEVICES)) {
+            loaded_blob=true;
+        }
+    }
     if(!loaded_blob) {
         memset(snapshot.get(),0,sizeof(*snapshot));
         n=sizeof(*snapshot);
@@ -968,18 +982,22 @@ esp_err_t send_devices(httpd_req_t *req, bool include_telemetry)
         return send_json(req, "500 Internal Server Error", "{\"ok\":false,\"message\":\"Brak pamieci.\"}");
     }
     cJSON_AddItemToObject(root, "devices", arr);
-    DeviceRegistry snapshot{};
-    devices_snapshot(&snapshot);
-    for (size_t i = 0; i < snapshot.count; i++) {
+    auto snapshot = std::unique_ptr<DeviceRegistry>(new(std::nothrow) DeviceRegistry{});
+    if (!snapshot) {
+        cJSON_Delete(root);
+        return send_json(req, "503 Service Unavailable", "{\"ok\":false,\"message\":\"Brak pamieci.\"}");
+    }
+    devices_snapshot(snapshot.get());
+    for (size_t i = 0; i < snapshot->count; i++) {
         cJSON *o = cJSON_CreateObject();
         if (!o) {
             break;
         }
-        cJSON_AddNumberToObject(o, "node", (double)snapshot.entries[i].node);
-        cJSON_AddStringToObject(o, "name", snapshot.entries[i].name);
-        cJSON_AddNumberToObject(o, "vid", snapshot.entries[i].vid);
-        cJSON_AddNumberToObject(o, "pid", snapshot.entries[i].pid);
-        if (include_telemetry) device_telemetry::append_json(snapshot.entries[i].node,o);
+        cJSON_AddNumberToObject(o, "node", (double)snapshot->entries[i].node);
+        cJSON_AddStringToObject(o, "name", snapshot->entries[i].name);
+        cJSON_AddNumberToObject(o, "vid", snapshot->entries[i].vid);
+        cJSON_AddNumberToObject(o, "pid", snapshot->entries[i].pid);
+        if (include_telemetry) device_telemetry::append_json(snapshot->entries[i].node,o);
         cJSON_AddItemToArray(arr, o);
     }
     char *text = cJSON_PrintUnformatted(root);

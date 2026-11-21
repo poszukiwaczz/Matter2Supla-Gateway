@@ -29,7 +29,7 @@ constexpr size_t kSamples=256,kNodes=64; // Scale64: stored in PSRAM and guarded
 EXT_RAM_BSS_ATTR Reading readings[kSamples];
 EXT_RAM_BSS_ATTR Contact contacts[kNodes];
 bool overflow=false;
-StaticSemaphore_t guard_storage;
+DRAM_ATTR StaticSemaphore_t guard_storage;
 SemaphoreHandle_t guard_handle=nullptr;
 portMUX_TYPE guard_init_mux=portMUX_INITIALIZER_UNLOCKED;
 struct TelemetryLock {
@@ -371,8 +371,9 @@ void forget_thread(uint64_t node) {
 }
 
 void append_json(uint64_t node,cJSON *device) {
- auto snapshot=std::unique_ptr<Reading[]>(new(std::nothrow) Reading[kSamples]);if(!snapshot)return;
- Contact c;bool truncated=false;const size_t count=copy(node,snapshot.get(),kSamples,c,truncated);
+ constexpr size_t kPerDeviceMax=32;
+ auto snapshot=std::unique_ptr<Reading[]>(new(std::nothrow) Reading[kPerDeviceMax]);if(!snapshot)return;
+ Contact c;bool truncated=false;const size_t count=copy(node,snapshot.get(),kPerDeviceMax,c,truncated);
  auto *out=cJSON_AddObjectToObject(device,"telemetry");if(!out)return;
  const int64_t now=esp_timer_get_time();int64_t last=c.report;
  cJSON_AddBoolToObject(out,"subscription_active",c.active);cJSON_AddBoolToObject(out,"truncated",truncated);
