@@ -1,0 +1,494 @@
+// Copyright 2023 Espressif Systems (Shanghai) PTE LTD
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include <algorithm>
+#include <cJSON.h>
+#include <esp_check.h>
+#include <esp_crt_bundle.h>
+#include <esp_err.h>
+#include <esp_http_client.h>
+#include <esp_log.h>
+#include <esp_matter_mem.h>
+#include <esp_matter_ota_candidates.h>
+#include <esp_matter_ota_provider.h>
+#include "../ota_file_size.h"
+#include <cmath>
+#include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
+#include <functional>
+#include <inttypes.h>
+
+#include <lib/core/DataModelTypes.h>
+#include <lib/support/ScopedMemoryBuffer.h>
+
+#include <string.h>
+
+using chip::Platform::ScopedMemoryBufferWithSize;
+
+namespace esp_matter {
+namespace ota_provider {
+
+static constexpr char TAG[] = "ota_provider";
+#if CONFIG_ESP_MATTER_OTA_PROVIDER_DCL_MAINNET
+static constexpr char dcl_rest_url[] = "https://on.dcl.csa-iot.org/dcl/model/versions";
+#elif CONFIG_ESP_MATTER_OTA_PROVIDER_DCL_TESTNET
+static constexpr char dcl_rest_url[] = "https://on.test-net.dcl.csa-iot.org/dcl/model/versions";
+#endif
+static constexpr size_t max_ota_candidate_count = CONFIG_ESP_MATTER_MAX_OTA_CANDIDATES_COUNT;
+
+static model_version_t *_ota_candidates_cache[max_ota_candidate_count];
+static QueueHandle_t _ota_candidate_task_queue = NULL;
+#ifdef CONFIG_ESP_MATTER_OTA_CANDIDATES_UPDATE_PERIODICALLY
+static esp_timer_handle_t _ota_candidates_update_timer = NULL;
+#endif
+
+typedef struct {
+    uint16_t vendor_id;
+    uint16_t product_id;
+    uint32_t software_version;
+    fetch_ota_image_done_callback_t callback;
+    void *callback_args;
+} ota_candidate_fetch_action_t;
+
+static bool _is_ota_candidate_valid(model_version_t *model, uint32_t current_software_version)
+{
+    return model->software_version > current_software_version &&
+           model->max_applicable_software_version >= current_software_version &&
+           model->min_applicable_software_version <= current_software_version;
+}
+
+// Search the OTA candidate from the cache, return the index of candidate on success, or return -1 on failure.
+static int _search_ota_candidate_from_cache(uint16_t vendor_id, uint16_t product_id, uint32_t software_ver)
+{
+    for (size_t index = 0; index < max_ota_candidate_count; ++index) {
+        model_version_t *cur_model = _ota_candidates_cache[index];
+        if (cur_model) {
+            if (cur_model->vendor_id == vendor_id && cur_model->product_id == product_id) {
+                if (_is_ota_candidate_valid(cur_model, software_ver)) {
+                    return index;
+                } else {
+                    // This candidate is not valid, expire it.
+                    esp_matter_mem_free(cur_model);
+                    _ota_candidates_cache[index] = nullptr;
+                    return -1;
+                }
+            }
+        }
+    }
+    return -1;
+}
+
+static size_t _find_empty_ota_candidates()
+{
+    uint32_t oldest_candidate_lifetime = 0;
+    size_t oldest_candidate_index = 0;
+    for (size_t index = 0; index < max_ota_candidate_count; ++index) {
+        if (!_ota_candidates_cache[index]) {
+            return index;
+        } else {
+            if (oldest_candidate_lifetime < _ota_candidates_cache[index]->lifetime) {
+                oldest_candidate_lifetime = _ota_candidates_cache[index]->lifetime;
+                oldest_candidate_index = index;
+            }
+        }
+    }
+    // expire the oldest candidate
+    esp_matter_mem_free(_ota_candidates_cache[oldest_candidate_index]);
+    _ota_candidates_cache[oldest_candidate_index] = nullptr;
+    return oldest_candidate_index;
+}
+
+static void _increase_ota_candidates_lifetime()
+{
+    for (size_t index = 0; index < max_ota_candidate_count; ++index) {
+        if (_ota_candidates_cache[index]) {
+            _ota_candidates_cache[index]->lifetime++;
+        }
+    }
+}
+
+static esp_err_t _query_software_version_array(const uint16_t vendor_id, const uint16_t product_id,
+                                               uint32_t **software_version_array, size_t &software_version_count)
+{
+    if (!software_version_array) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t ret = ESP_OK;
+    int sw_ver_count = 0, sw_ver_index = 0;
+    char url[100];
+    snprintf(url, sizeof(url), "%s/%d/%d", dcl_rest_url, vendor_id, product_id);
+    esp_http_client_config_t config = {
+        .url = url,
+        .transport_type = HTTP_TRANSPORT_OVER_SSL,
+        .buffer_size = 1024,
+        .skip_cert_common_name_check = false,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+    esp_http_client_handle_t client = NULL;
+    ScopedMemoryBufferWithSize<char> http_payload;
+    int http_len, http_status_code;
+    cJSON *root = nullptr;
+
+    client = esp_http_client_init(&config);
+    if (!client) {
+        ESP_LOGE(TAG, "Failed to initialise HTTP Client.");
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_GOTO_ON_ERROR(esp_http_client_set_header(client, "accept", "application/json"), cleanup, TAG,
+                      "Failed to set http header accept");
+    ESP_GOTO_ON_ERROR(esp_http_client_set_method(client, HTTP_METHOD_GET), cleanup, TAG, "Failed to set http method");
+
+    // HTTP GET
+    ESP_GOTO_ON_ERROR(esp_http_client_open(client, 0), cleanup, TAG, "Failed to open http connection");
+
+    // Read Response
+    http_len = esp_http_client_fetch_headers(client);
+    http_status_code = esp_http_client_get_status_code(client);
+    http_payload.Calloc(1024);
+    if ((http_len > 0) && (http_status_code == 200)) {
+        ESP_GOTO_ON_FALSE(http_payload.Get(), ESP_ERR_NO_MEM, close, TAG, "Failed to alloc memory for http_payload");
+        http_len = esp_http_client_read_response(client, http_payload.Get(), http_payload.AllocatedSize() - 1);
+    } else {
+        http_len = esp_http_client_read_response(client, http_payload.Get(), http_payload.AllocatedSize() - 1);
+        ESP_LOGE(TAG, "Invalid response for %s", url);
+        ESP_LOGE(TAG, "Status = %d, Data = %s", http_status_code, http_len > 0 ? http_payload.Get() : "None");
+        ret = ESP_FAIL;
+        goto close;
+    }
+    ESP_LOGD(TAG, "http_response:\n%s", http_payload.Get());
+
+    // Parse the response payload
+    ESP_GOTO_ON_FALSE(http_len > 0, ESP_FAIL, close, TAG, "Invalid http response length");
+    root = cJSON_ParseWithLength(http_payload.Get(), http_len);
+    ESP_GOTO_ON_FALSE(root, ESP_FAIL, close, TAG, "Failed to parse the http response json");
+    {
+        cJSON *model_versions = cJSON_GetObjectItemCaseSensitive(root, "modelVersions");
+        cJSON *software_versions = cJSON_GetObjectItemCaseSensitive(model_versions, "softwareVersions");
+        sw_ver_count = cJSON_GetArraySize(software_versions);
+        if (cJSON_IsObject(model_versions) && cJSON_IsArray(software_versions) && sw_ver_count > 0) {
+            *software_version_array = (uint32_t *)esp_matter_mem_calloc(sw_ver_count, sizeof(uint32_t));
+            if (*software_version_array) {
+                software_version_count = sw_ver_count;
+                for (sw_ver_index = 0; sw_ver_index < sw_ver_count; ++sw_ver_index) {
+                    cJSON *software_version = cJSON_GetArrayItem(software_versions, sw_ver_index);
+                    if (cJSON_IsNumber(software_version)) {
+                        ESP_RETURN_ON_FALSE(software_version->valuedouble >= 0 && software_version->valuedouble <= UINT32_MAX,
+                                            ESP_ERR_INVALID_ARG, TAG, "Invalid range");
+                        (*software_version_array)[sw_ver_index] = static_cast<uint32_t>(software_version->valuedouble);
+                    } else {
+                        ret = ESP_ERR_INVALID_ARG;
+                    }
+                }
+            } else {
+                ret = ESP_ERR_NO_MEM;
+            }
+        } else {
+            ret = ESP_FAIL;
+        }
+    }
+    cJSON_Delete(root);
+
+close:
+    esp_http_client_close(client);
+cleanup:
+    esp_http_client_cleanup(client);
+
+    if (ret != ESP_OK) {
+        if (*software_version_array) {
+            esp_matter_mem_free(*software_version_array);
+            *software_version_array = nullptr;
+            software_version_count = 0;
+        }
+    }
+    return ret;
+}
+
+static esp_err_t _query_ota_candidate(model_version_t *model, uint32_t new_software_version,
+                                      uint32_t current_software_version)
+{
+    if (!model) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t ret = ESP_OK;
+    char url[128];
+    snprintf(url, sizeof(url), "%s/%d/%d/%" PRIu32, dcl_rest_url, model->vendor_id, model->product_id, new_software_version);
+    esp_http_client_config_t config = {
+        .url = url,
+        .transport_type = HTTP_TRANSPORT_OVER_SSL,
+        .buffer_size = 1024,
+        .skip_cert_common_name_check = false,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+    esp_http_client_handle_t client = NULL;
+    ScopedMemoryBufferWithSize<char> http_payload;
+    int http_len, http_status_code;
+    uint32_t max_applicable_software_version, min_applicable_software_version;
+    cJSON *root = nullptr;
+
+    client = esp_http_client_init(&config);
+    ESP_RETURN_ON_FALSE(client, ESP_FAIL, TAG, "Failed to initialise HTTP Client.");
+    ESP_GOTO_ON_ERROR(esp_http_client_set_header(client, "accept", "application/json"), cleanup, TAG,
+                      "Failed to set http header accept");
+    ESP_GOTO_ON_ERROR(esp_http_client_set_method(client, HTTP_METHOD_GET), cleanup, TAG, "Failed to set http method");
+
+    // HTTP GET
+    ESP_GOTO_ON_ERROR(esp_http_client_open(client, 0), cleanup, TAG, "Failed to open http connection");
+
+    // Read Response
+    http_len = esp_http_client_fetch_headers(client);
+    http_status_code = esp_http_client_get_status_code(client);
+    http_payload.Calloc(1024);
+    if ((http_len > 0) && (http_status_code == 200)) {
+        ESP_GOTO_ON_FALSE(http_payload.Get(), ESP_ERR_NO_MEM, close, TAG, "Failed to alloc memory for http_payload");
+        http_len = esp_http_client_read_response(client, http_payload.Get(), http_payload.AllocatedSize() - 1);
+    } else {
+        http_len = esp_http_client_read_response(client, http_payload.Get(), http_payload.AllocatedSize() - 1);
+        ESP_LOGE(TAG, "Invalid response for %s", url);
+        ESP_LOGE(TAG, "Status = %d, Data = %s", http_status_code, http_len > 0 ? http_payload.Get() : "None");
+        ret = ESP_FAIL;
+        goto close;
+    }
+    ESP_LOGD(TAG, "http_response:\n%s", http_payload.Get());
+
+    ESP_GOTO_ON_FALSE(http_len > 0, ESP_FAIL, close, TAG, "Invalid http response length");
+    root = cJSON_ParseWithLength(http_payload.Get(), http_len);
+    ESP_GOTO_ON_FALSE(root, ESP_FAIL, close, TAG, "Failed to parse the http response json");
+    {
+        ret = ESP_ERR_NOT_FINISHED;
+        cJSON *model_version = cJSON_GetObjectItemCaseSensitive(root, "modelVersion");
+        cJSON *max_applicable = cJSON_GetObjectItemCaseSensitive(model_version, "maxApplicableSoftwareVersion");
+        cJSON *min_applicable = cJSON_GetObjectItemCaseSensitive(model_version, "minApplicableSoftwareVersion");
+        cJSON *software_valid = cJSON_GetObjectItemCaseSensitive(model_version, "softwareVersionValid");
+        if (cJSON_IsObject(model_version) && cJSON_IsNumber(max_applicable) && cJSON_IsNumber(min_applicable) &&
+                cJSON_IsBool(software_valid) && cJSON_IsTrue(software_valid)) {
+            max_applicable_software_version =
+                max_applicable->valuedouble >= 0 && max_applicable->valuedouble < UINT32_MAX ? static_cast<uint32_t>(max_applicable->valuedouble) : 0;
+            min_applicable_software_version =
+                min_applicable->valuedouble >= 0 && min_applicable->valuedouble < UINT32_MAX ? static_cast<uint32_t>(min_applicable->valuedouble) : 0;
+            if (max_applicable_software_version >= current_software_version &&
+                    min_applicable_software_version <= current_software_version &&
+                    new_software_version > current_software_version) {
+                model->max_applicable_software_version = max_applicable_software_version;
+                model->min_applicable_software_version = min_applicable_software_version;
+                model->software_version = new_software_version;
+                cJSON *cd_version = cJSON_GetObjectItemCaseSensitive(model_version, "cdVersionNumber");
+                if (cJSON_IsNumber(cd_version)) {
+                    model->cd_version_number = cd_version->valueint;
+                }
+                cJSON *software_version_string = cJSON_GetObjectItemCaseSensitive(model_version, "softwareVersionString");
+                const char *software_version_string_value = cJSON_GetStringValue(software_version_string);
+                if (software_version_string_value) {
+                    strlcpy(model->software_version_str, software_version_string_value, sizeof(model->software_version_str));
+                }
+                cJSON *ota_url = cJSON_GetObjectItemCaseSensitive(model_version, "otaUrl");
+                const char *ota_url_value = cJSON_GetStringValue(ota_url);
+                const auto *size_item=cJSON_GetObjectItemCaseSensitive(model_version,"otaFileSize");
+                uint32_t image_size=0;
+                bool valid_size=!size_item || cJSON_IsNull(size_item);
+                if(cJSON_IsString(size_item))valid_size=matter_ota::decimal_file_size(cJSON_GetStringValue(size_item),image_size);
+                if(cJSON_IsNumber(size_item)) {
+                    const double size=size_item->valuedouble;
+                    valid_size=std::isfinite(size) && size>=0 && size<=UINT32_MAX && floor(size)==size;
+                    if(valid_size)image_size=static_cast<uint32_t>(size);
+                }
+                if (ota_url_value && strncmp(ota_url_value,"https://",8)==0 &&
+                    strlen(ota_url_value)<sizeof(model->ota_url) && valid_size) {
+                    strlcpy(model->ota_url, ota_url_value, sizeof(model->ota_url));
+                    model->ota_file_size=image_size;
+                    ret=ESP_OK;
+                }
+            }
+        }
+        if (ret == ESP_ERR_NOT_FINISHED) {
+            ESP_LOGI(TAG, "This result is not valid for software version %ld, skip it", current_software_version);
+        }
+    }
+    cJSON_Delete(root);
+
+close:
+    esp_http_client_close(client);
+cleanup:
+    esp_http_client_cleanup(client);
+    return ret;
+}
+
+#ifdef CONFIG_ESP_MATTER_OTA_CANDIDATES_UPDATE_PERIODICALLY
+static void _update_all_ota_candidates_cache()
+{
+    for (size_t index = 0; index < max_ota_candidate_count; ++index) {
+        model_version_t *candidate = _ota_candidates_cache[index];
+        if (candidate) {
+            uint32_t *software_version_array = nullptr;
+            size_t software_version_count;
+            esp_err_t err = _query_software_version_array(candidate->vendor_id, candidate->product_id,
+                                                          &software_version_array, software_version_count);
+            if (err == ESP_OK && software_version_array && software_version_count > 0) {
+                std::sort(&software_version_array[0], &software_version_array[software_version_count],
+                          std::greater<uint32_t>());
+                for (size_t ver_index = 0;
+                        ver_index < software_version_count && software_version_array[ver_index] > candidate->software_version;
+                        ++ver_index) {
+                    err = _query_ota_candidate(candidate, software_version_array[ver_index], candidate->software_version);
+                    if (err == ESP_OK) {
+                        break;
+                    }
+                }
+                esp_matter_mem_free(software_version_array);
+            }
+        }
+    }
+}
+
+static void _ota_candidates_periodic_update_handler(void *arg)
+{
+    ota_candidate_fetch_action_t action;
+    action.vendor_id = chip::kMaxVendorId;
+    if (xQueueSend(_ota_candidate_task_queue, &action, portMAX_DELAY) != pdTRUE) {
+        ESP_LOGE(TAG, "Failed send search ota candidate action");
+    }
+}
+#endif
+
+static void _ota_candidate_fetch_handler(ota_candidate_fetch_action_t &action)
+{
+    model_version_t *candidate = nullptr;
+    assert(action.callback);
+    // Search the ota candidate from cache, if we find a proper candidate return the candidate. Otherwise we will search
+    // a new candidate from DCL.
+    int candidate_index = _search_ota_candidate_from_cache(action.vendor_id, action.product_id, action.software_version);
+    if (candidate_index >= 0 && candidate_index < max_ota_candidate_count && _ota_candidates_cache[candidate_index]) {
+        candidate = _ota_candidates_cache[candidate_index];
+        action.callback(EspOtaProvider::OTAQueryStatus::kUpdateAvailable, candidate->ota_url, candidate->ota_file_size,
+                        candidate->software_version, candidate->software_version_str, action.callback_args);
+        return;
+    } else {
+        // Cannot find the candidate from cache, we need to query DCL for a new candidate;
+        uint32_t *software_version_array = nullptr;
+        size_t software_version_count;
+        esp_err_t err = _query_software_version_array(action.vendor_id, action.product_id, &software_version_array,
+                                                      software_version_count);
+        if (err == ESP_OK && software_version_array && software_version_count > 0) {
+            // Sort the software version array
+            std::sort(&software_version_array[0], &software_version_array[software_version_count],
+                      std::greater<uint32_t>());
+            candidate = (model_version_t *)esp_matter_mem_calloc(1, sizeof(model_version_t));
+            candidate->vendor_id = action.vendor_id;
+            candidate->product_id = action.product_id;
+            for (size_t index = 0;
+                    index < software_version_count && software_version_array[index] > action.software_version; ++index) {
+                err = _query_ota_candidate(candidate, software_version_array[index], action.software_version);
+                if (err == ESP_OK) {
+                    size_t empty_index = _find_empty_ota_candidates();
+                    _increase_ota_candidates_lifetime();
+                    candidate->lifetime = 0;
+                    // Add this candidate to cache
+                    _ota_candidates_cache[empty_index] = candidate;
+                    action.callback(EspOtaProvider::OTAQueryStatus::kUpdateAvailable, candidate->ota_url,
+                                    candidate->ota_file_size, candidate->software_version,
+                                    candidate->software_version_str, action.callback_args);
+                    esp_matter_mem_free(software_version_array);
+                    return;
+                }
+            }
+            esp_matter_mem_free(candidate);
+            esp_matter_mem_free(software_version_array);
+        }
+    }
+    // Cannot fetch the candidate
+    action.callback(EspOtaProvider::OTAQueryStatus::kNotAvailable, nullptr, 0, 0, nullptr, action.callback_args);
+}
+
+static void ota_candidate_task(void *ctx)
+{
+    ota_candidate_fetch_action_t action;
+    while (true) {
+        if (xQueueReceive(_ota_candidate_task_queue, &action, portMAX_DELAY) == pdTRUE) {
+            if (action.vendor_id != chip::kMaxVendorId) {
+                _ota_candidate_fetch_handler(action);
+            }
+#ifdef CONFIG_ESP_MATTER_OTA_CANDIDATES_UPDATE_PERIODICALLY
+            else {
+                // If receiving an action with Max VendorId, try to update all the candidates cache.
+                _update_all_ota_candidates_cache();
+            }
+#endif
+        }
+    }
+    vQueueDelete(_ota_candidate_task_queue);
+    vTaskDelete(NULL);
+}
+
+esp_err_t fetch_ota_candidate(const uint16_t vendor_id, const uint16_t product_id, const uint32_t software_version,
+                              fetch_ota_image_done_callback_t callback, void *ctx)
+{
+    if (!_ota_candidate_task_queue) {
+        ESP_LOGE(TAG, "Failed to search ota candidate as the task queue is not initialized");
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (!callback) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    ota_candidate_fetch_action_t action;
+    action.vendor_id = vendor_id;
+    action.product_id = product_id;
+    action.software_version = software_version;
+    action.callback = callback;
+    action.callback_args = ctx;
+    if (xQueueSend(_ota_candidate_task_queue, &action, portMAX_DELAY) != pdTRUE) {
+        ESP_LOGE(TAG, "Failed send search ota candidate action");
+        return ESP_ERR_NOT_FOUND;
+    }
+    return ESP_OK;
+}
+
+esp_err_t init_ota_candidates()
+{
+    memset(_ota_candidates_cache, 0, sizeof(_ota_candidates_cache));
+    if (_ota_candidate_task_queue) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    _ota_candidate_task_queue = xQueueCreate(8, sizeof(ota_candidate_fetch_action_t));
+    if (!_ota_candidate_task_queue) {
+        ESP_LOGE(TAG, "Failed to create ota_candidate task queue");
+        return ESP_ERR_NO_MEM;
+    }
+
+    static TaskHandle_t task_handle = NULL;
+    if (task_handle) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xTaskCreate(ota_candidate_task, "ota_candidate", 8192, NULL, 5, NULL) != pdTRUE) {
+        ESP_LOGE(TAG, "Failed to create ota_candidate task");
+        return ESP_ERR_NO_MEM;
+    }
+#ifdef CONFIG_ESP_MATTER_OTA_CANDIDATES_UPDATE_PERIODICALLY
+    if (!_ota_candidates_update_timer) {
+        // start a timer which will update the candidates cache everyday.
+        // ESP-IDF esp_timer_init_os initializes the system timer before app_main.
+        const esp_timer_create_args_t timer_args = {
+            .callback = _ota_candidates_periodic_update_handler, .arg = nullptr, .name = "ota_candidates_update_timer"
+        };
+        esp_timer_create(&timer_args, &_ota_candidates_update_timer);
+        esp_timer_start_periodic(_ota_candidates_update_timer,
+                                 (uint64_t)CONFIG_ESP_MATTER_OTA_CANDIDATES_UPDATE_PERIOD * 3600 * 1000 * 1000);
+    }
+#endif
+    return ESP_OK;
+}
+
+} // namespace ota_provider
+} // namespace esp_matter

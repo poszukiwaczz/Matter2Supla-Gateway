@@ -1,0 +1,5 @@
+{
+  "upstream_sha256": {
+    "src/controller/SetUpCodePairer.cpp": "3f3488e11fa91eb9d2718aa075a2afc1bd9afa2f2f1ad3e44db47e6d57784e0a"
+  }
+}

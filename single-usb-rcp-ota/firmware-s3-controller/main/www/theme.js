@@ -1,0 +1,1 @@
+(function(){"use strict";var theme="light";try{theme=localStorage.getItem("m2s-theme")||"light";}catch(_){}if("light,dark,thread".split(",").indexOf(theme)<0)theme="light";document.documentElement.dataset.theme=theme;})();
