@@ -22,3 +22,6 @@ __pycache__/
 
 scripts/Install-S3-Gemini1-Serial.py
 scripts/Verify-Live033.py
+
+scripts/Install-S3-Gemini2-Serial.py
+scripts/Upload-Ota033Gemini2.py

@@ -21,14 +21,12 @@
 extern "C" esp_err_t supla_bridge_mqtt_command(uint64_t,uint16_t,bool);
 extern "C" uint32_t supla_bridge_stale_seconds(uint64_t,bool);
 namespace gateway {namespace {
-// Placed in PSRAM (.ext_ram.bss) to save ~14 KiB of internal DRAM.
-struct Config {bool enabled=false;char uri[181]{},user[81]{},password[129]{},ca[4097]{};};
-EXT_RAM_BSS_ATTR Config desired;
-EXT_RAM_BSS_ATTR Config running;
+// Keep spinlock-copied config in internal SRAM so portENTER_CRITICAL(&lock) never stalls on external SPI/Octal PSRAM.
+struct Config {bool enabled=false;char uri[181]{},user[81]{},password[129]{},ca[4097]{};} desired,running;
 portMUX_TYPE lock=portMUX_INITIALIZER_UNLOCKED;uint32_t generation=1,applied=0;esp_mqtt_client_handle_t client=nullptr;std::atomic<bool> connected{false},rediscover{false};char base[64]{},availability[88]{};QueueHandle_t commands=nullptr;
 struct Command {uint64_t node;uint16_t ep;bool on;bool from_mqtt=false;};
 struct Track {uint64_t node=0;uint16_t ep=0;uint8_t metric=0;bool seen=false;uint32_t config_hash=0;int64_t raw=0,last_publish=0;bool last_valid=false,last_available=false;};
-EXT_RAM_BSS_ATTR Track tracked[128];
+Track tracked[128];
 struct Description {const char *key,*name,*unit,*device_class,*state_class;uint32_t divisor;};
 const Description descriptions[]={{"temperature","Temperatura","°C","temperature","measurement",100},{"humidity","Wilgotność","%","humidity","measurement",100},{"battery","Bateria","%","battery","measurement",2},{"onoff","Zasilanie","",nullptr,nullptr,1},{"voltage","Napięcie","V","voltage","measurement",1000},{"current","Prąd","A","current","measurement",1000},{"active_power","Moc czynna","W","power","measurement",1000},{"imported_energy","Energia pobrana","kWh","energy","total_increasing",1000000},{"exported_energy","Energia oddana","kWh","energy","total_increasing",1000000}};
 bool uri_valid(const char *s){if(!s){return false;}

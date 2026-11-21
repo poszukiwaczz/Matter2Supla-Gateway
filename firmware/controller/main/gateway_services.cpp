@@ -11,7 +11,6 @@
 #include <esp_flash.h>
 #include <esp_partition.h>
 #include <esp_ota_ops.h>
-#include <mdns.h>
 #include "app_image_size.h"
 #include <cmath>
 #include <esp_openthread.h>
@@ -66,28 +65,6 @@ void init_crash_breadcrumb() {
   s_rtc_crash.last_abnormal_reason = reason;
  }
  s_rtc_crash.current_uptime_s = 0;
-}
-
-// Option 3: mDNS announcer for matter2supla.local and _matter2supla._tcp
-bool s_mdns_advertised = false;
-void maintain_mdns_advertisement() {
- if (s_mdns_advertised) return;
- wifi_health_t wh{};
- wifi_manager_health(&wh);
- if (!wh.gateway_probe_active) return;
- if (mdns_init() == ESP_OK) {
-  mdns_hostname_set("matter2supla");
-  char gw_name[gateway_name_capacity];
-  read_gateway_name(gw_name);
-  mdns_instance_name_set(gw_name);
-  mdns_txt_item_t txt[2] = {
-   {"version", FW_VERSION},
-   {"name", gw_name}
-  };
-  mdns_service_add(gw_name, "_matter2supla", "_tcp", 443, txt, 2);
-  s_mdns_advertised = true;
-  ESP_LOGI("gateway_health", "mDNS advertised: https://matter2supla.local/ (_matter2supla._tcp:443)");
- }
 }
 #if CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS && !CONFIG_FREERTOS_SMP && CONFIG_ESP_IPC_ENABLE
 constexpr int cpu_cores = CONFIG_FREERTOS_NUMBER_OF_CORES;
@@ -173,7 +150,6 @@ void add_cpu_diagnostics(cJSON *j, int64_t now)
 std::atomic<TaskHandle_t> gateway_worker{nullptr};
 void work(void*){gateway_worker.store(xTaskGetCurrentTaskHandle());int64_t next=0;for(;;){const auto now=esp_timer_get_time();
  s_rtc_crash.current_uptime_s = static_cast<uint32_t>(now / 1000000);
- maintain_mdns_advertisement();
  if(now>=next){Radio r;portENTER_CRITICAL(&guard);r=radio;portEXIT_CRITICAL(&guard);r.tried=now;
   if(esp_openthread_get_instance()&&esp_openthread_lock_acquire(pdMS_TO_TICKS(20))){int8_t power=0;r.result=otPlatRadioGetTransmitPower(esp_openthread_get_instance(),&power);
    if(r.result==ESP_OK){r.good=esp_timer_get_time();r.consecutive_failed=0;const char *v=otPlatRadioGetVersionString(esp_openthread_get_instance());snprintf(r.version,sizeof(r.version),"%s",v?v:"");}

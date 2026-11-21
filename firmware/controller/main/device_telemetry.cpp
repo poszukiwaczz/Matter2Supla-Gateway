@@ -24,9 +24,9 @@
 #include <new>
 namespace device_telemetry {
 namespace {
-constexpr size_t kSamples=128,kNodes=32; // Diagnostic storage in PSRAM, freeing ~14 KiB internal DRAM.
-EXT_RAM_BSS_ATTR Reading readings[kSamples];
-EXT_RAM_BSS_ATTR Contact contacts[kNodes];
+constexpr size_t kSamples=128,kNodes=32; // Keep spinlock-guarded tables in fast internal SRAM so IRQ-off critical sections stay sub-microsecond.
+Reading readings[kSamples];
+Contact contacts[kNodes];
 bool overflow=false;
 portMUX_TYPE guard=portMUX_INITIALIZER_UNLOCKED;
 Contact *contact(uint64_t node) {

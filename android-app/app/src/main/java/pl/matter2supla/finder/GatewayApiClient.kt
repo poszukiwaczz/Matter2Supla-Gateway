@@ -106,7 +106,7 @@ class GatewayApiClient(
                 setRequestProperty("Origin", "https://$ip")
                 setRequestProperty("Authorization", "Bearer $credential")
                 setRequestProperty("Accept", "application/json")
-                setRequestProperty("Connection", "close")
+                setRequestProperty("Connection", "keep-alive")
                 if (body != null) {
                     setRequestProperty("Content-Type", "application/json")
                     doOutput = true
@@ -134,14 +134,13 @@ class GatewayApiClient(
             }
             ApiResult(code = statusCode, json = parsed, rawBody = raw)
         } catch (e: Exception) {
+            conn?.disconnect()
             ApiResult(
                 code = -1,
                 json = null,
                 rawBody = "",
                 error = e.message ?: e.javaClass.simpleName
             )
-        } finally {
-            conn?.disconnect()
         }
     }
 }

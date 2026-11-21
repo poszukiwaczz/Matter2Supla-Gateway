@@ -165,7 +165,7 @@ fun NativeGatewayPanelScreen(
         }
         fetchTabData(selectedTab, showSpinner = isInitialEmpty)
         while (isActive) {
-            delay(2500L)
+            delay(5000L)
             fetchTabData(selectedTab, showSpinner = false)
         }
     }

@@ -178,7 +178,6 @@ class MatterRelayElement : public Supla::Control::VirtualRelay {
     state = confirmed_state_;
     if (endpoint_ == m2s::mapping::kNone || !quick_add_device_exists(node_)) return;
     const bool on = value;
-    // Offload Matter invoke command from supla_task so SUPLA keepalives/draining never block on CHIP lock.
     esp_err_t err = gateway::relay_enqueue(node_, endpoint_, on);
     if (err == ESP_OK) {
       ESP_LOGI(TAG, "Supla -> Matter (queued): OnOff=%d (node %llu, ep %u)",
@@ -583,39 +582,27 @@ static void on_attribute_report(uint64_t node,
 
 static bool measurement_paths(uint64_t node, chip::Platform::ScopedMemoryBufferWithSize<chip::app::AttributePathParams> &paths)
 {
-  bool has_mapped = false, read_relay = false, read_th = false, read_electrical = false;
+  bool read_electrical = false;
   if (const auto *model = s_runtime_map.load()) {
     for (size_t i = 0; i < model->count; ++i) {
       const auto &channel = model->channels[i];
-      if (channel.node != node || channel.retired) continue;
-      has_mapped = true;
-      if (channel.kind == mapping::Kind::Relay) read_relay = true;
-      else if (channel.kind == mapping::Kind::Thermohygrometer) read_th = true;
-      else if (channel.kind == mapping::Kind::ElectricityMeter) read_electrical = true;
+      if (channel.node == node && !channel.retired && channel.kind == mapping::Kind::ElectricityMeter) {
+        read_electrical = true;
+        break;
+      }
     }
   }
-  if (!has_mapped) {
-    // Unmapped node: subscribe to basic sensor + relay attributes so telemetry & discovery work out of the box.
-    read_relay = true;
-    read_th = true;
-  }
-  const size_t total = (read_relay ? 1 : 0) + (read_th ? 3 : 0) + (read_electrical ? 5 : 0);
-  if (total == 0 || !paths.Alloc(total)) return false;
-  size_t idx = 0;
-  if (read_relay) {
-    paths[idx++] = chip::app::AttributePathParams(0xffff, 0x0006, 0);
-  }
-  if (read_th) {
-    paths[idx++] = chip::app::AttributePathParams(0xffff, 0x0402, 0);
-    paths[idx++] = chip::app::AttributePathParams(0xffff, 0x0405, 0);
-    paths[idx++] = chip::app::AttributePathParams(0xffff, 0x002f, 0x000c);
-  }
+  if (!paths.Alloc(read_electrical ? 9 : 4)) return false;
+  paths[0] = chip::app::AttributePathParams(0xffff, 0x0006, 0);
+  paths[1] = chip::app::AttributePathParams(0xffff, 0x0402, 0);
+  paths[2] = chip::app::AttributePathParams(0xffff, 0x0405, 0);
+  paths[read_electrical?8:3]=chip::app::AttributePathParams(0xffff,0x002f,0x000c);
   if (read_electrical) {
     for (uint8_t role = static_cast<uint8_t>(mapping::Role::Voltage);
          role <= static_cast<uint8_t>(mapping::Role::ExportedEnergy); ++role) {
       uint32_t cluster, attribute;
       mapping::source_path(static_cast<mapping::Role>(role), cluster, attribute);
-      paths[idx++] = chip::app::AttributePathParams(0xffff, cluster, attribute);
+      paths[role] = chip::app::AttributePathParams(0xffff, cluster, attribute);
     }
   }
 
@@ -665,7 +652,7 @@ class BridgeSubscription final : public esp_matter::controller::subscribe_comman
 public:
   BridgeSubscription(size_t slot,uint64_t node,
       chip::Platform::ScopedMemoryBufferWithSize<chip::app::AttributePathParams> &&paths)
-    : subscribe_command(node,std::move(paths),{},1,300,true,
+    : subscribe_command(node,std::move(paths),{},0,600,true,
         [](uint64_t peer,const auto &path,auto *data,const auto &status){
           if(quick_add_device_exists(peer))on_attribute_report(peer,path,data,status,device_telemetry::Source::Subscription);
         },nullptr,nullptr,nullptr,nullptr,false),slot_(slot),node_(node) {}
@@ -676,8 +663,7 @@ public:
     ESP_LOGI(TAG,"Matter reporting node %llu: released, retry after backoff",(unsigned long long)node_);
   }
   void OnSubscriptionEstablished(chip::SubscriptionId id) override {
-    resubscribe_attempts_ = 0;
-    reporting_live(slot_,true,true,300);
+    reporting_live(slot_,true,true,600);
     ESP_LOGI(TAG,"Matter reporting node %llu: established, id %lu",(unsigned long long)node_,(unsigned long)id);
     subscribe_command::OnSubscriptionEstablished(id);
   }
@@ -699,16 +685,10 @@ public:
   }
   CHIP_ERROR OnResubscriptionNeeded(chip::app::ReadClient *client,CHIP_ERROR cause) override {
     reporting_live(slot_,false);
-    ESP_LOGW(TAG,"Matter reporting node %llu: resubscribe #%u (%s)",
-             (unsigned long long)node_, (unsigned)(resubscribe_attempts_ + 1), chip::ErrorStr(cause));
+    ESP_LOGW(TAG,"Matter reporting node %llu: resubscribe (%s)",(unsigned long long)node_,chip::ErrorStr(cause));
     if(!quick_add_device_exists(node_))return cause;
-    // Cap CHIP's Fibonacci backoff at 3 attempts so we never get stuck in a 30-92 min
-    // wait with state.owned=true after a transient RF/CCA outage. After 3 failed tries,
-    // destroy this subscription and let maintain_reporting() start fresh on a 30s cycle.
-    if (++resubscribe_attempts_ > 3) {
-      ESP_LOGW(TAG,"Matter reporting node %llu: max resubscribe attempts reached, resetting subscription",(unsigned long long)node_);
-      return cause;
-    }
+    // The SDK wrapper stops after two retries. Keep CHIP's bounded exponential
+    // backoff for sleepy devices instead of permanently abandoning reporting.
     return client->DefaultResubscribePolicy(cause);
   }
   void OnError(CHIP_ERROR error) override {
@@ -717,13 +697,12 @@ public:
   }
 private:
   size_t slot_;uint64_t node_;
-  uint8_t resubscribe_attempts_ = 0;
 };
 
 // Returns true while subscription establishment/reporting owns the normal path.
 static bool maintain_reporting(uint64_t node)
 {
-  // Caller holds CHIP lock.
+  // Caller holds CHIP lock. Never replace a live owner after an arbitrary timeout.
   size_t slot=0;
   while(slot<32 && s_reporting[slot].node!=node)++slot;
   if(slot==32) {
@@ -732,23 +711,6 @@ static bool maintain_reporting(uint64_t node)
     s_reporting[slot].node=node;
   }
   auto &state=s_reporting[slot];const uint32_t now=millis();
-  // Watchdog against zombie owned subscriptions: if not fresh and no report/attempt for >180s,
-  // tear down the stuck server/client subscription so a clean one can be created.
-  if (state.owned && !reporting_fresh(node, now)) {
-    uint32_t last_rep = 0;
-    portENTER_CRITICAL(&s_reporting_mutex);
-    last_rep = s_reporting_live[slot].report;
-    portEXIT_CRITICAL(&s_reporting_mutex);
-    const uint32_t ref = (last_rep && uint32_t(now - last_rep) < uint32_t(now - state.attempted)) ? last_rep : state.attempted;
-    if (uint32_t(now - ref) >= 180000) {
-      ESP_LOGW(TAG, "Matter reporting node %llu: zombie subscription watchdog (>180s stale), shutting down", (unsigned long long)node);
-      chip::app::InteractionModelEngine::GetInstance()->ShutdownSubscriptions(
-          esp_matter::controller::matter_controller_client::get_instance().get_fabric_index(), node);
-      state.owned = false;
-      state.attempted = now - 25000; // retry in ~5s
-      state.has_attempt = true;
-    }
-  }
   if(!state.owned && m2s::reporting::retry_due(state.has_attempt,now,state.attempted)) {
     chip::Platform::ScopedMemoryBufferWithSize<chip::app::AttributePathParams> paths;
     if(!measurement_paths(node,paths))return false;
@@ -819,7 +781,7 @@ static bool poll_device(uint64_t node)
   if(policy && !m2s::reporting::poll_due(policy->has_poll,now,policy->polled,interval))return true;
   PendingRead *free_slot = nullptr;
   for (auto &read : s_reads) {
-    if (read.node && uint32_t(now - read.started) >= 30000) read = {};
+    if (read.node && uint32_t(now - read.started) >= 60000) read = {};
     if (read.node == node) return true;
     if (!read.node && !free_slot) free_slot = &read;
   }
@@ -854,8 +816,8 @@ static void poll_task(void *)
 
   size_t cursor = 0;
   for (;;) {
-    // Matter subscriptions and telemetry must run even if SUPLA Cloud is not configured yet (Opus N2 fix).
-    {
+    // Thread traffic and subscription recovery must not depend on Wi-Fi IP.
+    if (s_active) {
       {esp_matter::lock::ScopedChipStackLock lock(portMAX_DELAY);release_removed_reporting();}
       uint64_t nodes[32];
       size_t count = quick_add_devices_copy(nodes, sizeof(nodes) / sizeof(nodes[0]));
@@ -1078,35 +1040,18 @@ extern "C" void supla_bridge_request_name_reload(void)
   s_reload_name.store(true);
 }
 
-static std::atomic<bool> s_poll_started{false};
-static std::atomic<bool> s_starting{false};
-
-static void ensure_poll_task_started()
-{
-  if (s_poll_started.exchange(true)) return;
-  if (s_queue_mutex == nullptr) {
-    s_queue_mutex = xSemaphoreCreateMutex();
-  }
-  if (xTaskCreate(poll_task, "supla_poll", 6144, nullptr, 4, nullptr) != pdPASS) {
-    ESP_LOGE(TAG, "Nie utworzono zadania odczytow Matter");
-    s_poll_started.store(false);
-  }
-}
-
 extern "C" void supla_bridge_start(void)
 {
-  ensure_poll_task_started();
-  if (s_active || s_starting.exchange(true)) {
+  if (s_active) {
     return;
   }
-  struct StartGuard { ~StartGuard() { s_starting.store(false); } } start_guard;
   supla_config_load();
   supla_cfg_t cfg_value{};
   if(supla_config_copy(&cfg_value)!=ESP_OK){s_active=false;
   return;}
   const supla_cfg_t *cfg=&cfg_value;
   if (!cfg->configured) {
-    ESP_LOGI(TAG, "Supla nieaktywna - brak konfiguracji (panel -> zakladka Supla); odczyty Matter dzialaja w tle");
+    ESP_LOGI(TAG, "Supla nieaktywna - brak konfiguracji (panel -> zakladka Supla)");
     return;
   }
 
@@ -1136,6 +1081,7 @@ extern "C" void supla_bridge_start(void)
     s_active = false;
     return;
   }
+  if(xTaskCreate(poll_task,"supla_poll",6144,nullptr,4,nullptr)!=pdPASS)ESP_LOGE(TAG,"Nie utworzono zadania odczytow Matter");
 
   ESP_LOGI(TAG, "Warstwa Supla uruchomiona");
 }
@@ -1174,15 +1120,14 @@ extern "C" esp_err_t supla_bridge_max_reserved_node(uint64_t *maximum) {
   esp_err_t err=nvs_open("m2s_channels",NVS_READONLY,&h);
   if(err==ESP_ERR_NVS_NOT_FOUND)return ESP_OK;
   if(err!=ESP_OK)return err;
-  auto map = std::unique_ptr<ChannelMap>(new (std::nothrow) ChannelMap{});
-  if (!map) { nvs_close(h); return ESP_ERR_NO_MEM; }
-  size_t n=sizeof(*map);
-  err=nvs_get_blob(h,"map",map.get(),&n);
+  ChannelMap map{};
+  size_t n=sizeof(map);
+  err=nvs_get_blob(h,"map",&map,&n);
   nvs_close(h);
   if(err==ESP_ERR_NVS_NOT_FOUND)return ESP_OK;
   if(err!=ESP_OK)return err;
-  if(n!=sizeof(*map)||map->version!=1||map->count>64)return ESP_ERR_INVALID_STATE;
-  for(size_t i=0;i<map->count;i++)if(map->entries[i].node>*maximum)*maximum=map->entries[i].node;
+  if(n!=sizeof(map)||map.version!=1||map.count>64)return ESP_ERR_INVALID_STATE;
+  for(size_t i=0;i<map.count;i++)if(map.entries[i].node>*maximum)*maximum=map.entries[i].node;
   return ESP_OK;
 }
 extern "C" const char *supla_bridge_state_name(void)

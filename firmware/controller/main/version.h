@@ -1,10 +1,10 @@
 /*
- * Wersja firmware Matter2Supla — Gemini Version.
- * Bazuje na 0.3.2-beta4 (Codex) z wdrożonymi poprawkami stabilności
- * odczytów Matter/Thread, pamięci RAM/PSRAM i audytu Opus + Gemini.
+ * Wersja firmware Matter2Supla — Gemini Version (r2).
+ * Poprawki: usunięcie konfliktu mDNS z CHIP, tablice spod spinlocków
+ * (portENTER_CRITICAL) w wewnętrznym SRAM (w PSRAM wyłącznie thread_peers 5,75 KiB).
  */
 
 #pragma once
 
-#define FW_VERSION "0.3.3-gemini1"
-#define FW_BUILD 30301
+#define FW_VERSION "0.3.3-gemini2"
+#define FW_BUILD 30302
