@@ -1,0 +1,15 @@
+jsQR (plik jsQR.js)
+===================
+
+Biblioteka dekodowania kodow QR w przegladarce, uzywana w panelu bramki
+(dekodowanie zdjecia z aparatu telefonu lokalnie, po stronie klienta).
+
+- Projekt: https://github.com/cozmo/jsQR
+- Wersja: 1.4.0 (npm: jsqr@1.4.0, plik dist/jsQR.js)
+- Pobrano z: https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js
+  (wersja zminifikowana przez jsDelivr/Terser; usunieto zbedna linie
+  sourceMappingURL)
+- Licencja: Apache License 2.0 (patrz repozytorium projektu)
+
+Plik jest osadzany w firmware bramki (EMBED_TXTFILES w main/CMakeLists.txt)
+i serwowany jako /jsQR.js.

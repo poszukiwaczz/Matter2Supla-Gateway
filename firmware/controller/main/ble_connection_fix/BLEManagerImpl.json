@@ -1,0 +1,5 @@
+{
+  "upstream_sha256": {
+    "src/platform/ESP32/nimble/BLEManagerImpl.cpp": "995b7f78180b9f0b9e5824b74765319961ff970aa9a83cf9efe82ddbf587219e"
+  }
+}

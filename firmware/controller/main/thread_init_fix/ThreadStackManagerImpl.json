@@ -1,0 +1,6 @@
+{
+  "upstream_sha256": {
+    "src/platform/ESP32/ThreadStackManagerImpl.cpp": "707702a0e15dfff56ed24087350cf71e21acc885fb1f389c54925d6ee104f78d",
+    "src/platform/OpenThread/GenericThreadStackManagerImpl_OpenThread.hpp": "6f8c5d6a93789a59f62f7ef3971221e6f09a2a5dc282754aa18dd77177dc37dd"
+  }
+}

@@ -1,0 +1,24 @@
+# Private / local installation data — NEVER commit
+backups/
+logs/
+private/
+*private*
+*.key
+update-signing-key.pem
+settings-encrypted.json
+before-*.bin
+after-*.bin
+hardware-*-verification.json
+
+# Build outputs & binary release bundles (attached to GitHub Releases instead)
+build-artifacts/
+do-wgrania/
+**/build/
+**/.gradle/
+android-app/local.properties
+android-app/*.apk
+__pycache__/
+*.pyc
+
+scripts/Install-S3-Gemini1-Serial.py
+scripts/Verify-Live033.py
