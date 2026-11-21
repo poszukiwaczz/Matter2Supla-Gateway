@@ -210,8 +210,8 @@ extern "C" void app_main()
     // --- lab: trwale Wi-Fi (NVS + tryb konfiguracji AP) i mini-panel WWW ---
     ESP_LOGI(TAG, "Startup stage: Wi-Fi manager");
     ESP_ERROR_CHECK(wifi_manager_start());
-    ESP_LOGI(TAG, "Startup stage: HTTPS panel");
-    quick_add_start();
+    ESP_LOGI(TAG, "Startup stage: gateway services & HTTPS panel");
     gateway::start();
+    quick_add_start();
     ESP_LOGI(TAG, "Startup stage: ready");
 }

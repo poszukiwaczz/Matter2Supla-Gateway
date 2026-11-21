@@ -18,13 +18,13 @@
 #include <cstdlib>
 #include <string>
 #include <utility>
-extern "C" esp_err_t supla_bridge_mqtt_command(uint64_t,uint16_t,bool);
+extern "C" esp_err_t supla_bridge_mqtt_command(uint64_t,uint16_t,bool,bool);
 extern "C" uint32_t supla_bridge_stale_seconds(uint64_t,bool);
 namespace gateway {namespace {
 // Keep spinlock-copied config in internal SRAM so portENTER_CRITICAL(&lock) never stalls on external SPI/Octal PSRAM.
 struct Config {bool enabled=false;char uri[181]{},user[81]{},password[129]{},ca[4097]{};} desired,running;
 portMUX_TYPE lock=portMUX_INITIALIZER_UNLOCKED;uint32_t generation=1,applied=0;esp_mqtt_client_handle_t client=nullptr;std::atomic<bool> connected{false},rediscover{false};char base[64]{},availability[88]{};QueueHandle_t commands=nullptr;
-struct Command {uint64_t node;uint16_t ep;bool on;bool from_mqtt=false;};
+struct Command {uint64_t node;uint16_t ep;bool on;bool from_mqtt=false;bool from_supla=false;};
 struct Track {uint64_t node=0;uint16_t ep=0;uint8_t metric=0;bool seen=false;uint32_t config_hash=0;int64_t raw=0,last_publish=0;bool last_valid=false,last_available=false;};
 Track tracked[128];
 struct Description {const char *key,*name,*unit,*device_class,*state_class;uint32_t divisor;};
@@ -53,13 +53,15 @@ uint32_t compute_discovery_hash(uint64_t node, uint16_t ep, unsigned metric, con
  return h ? h : 1;
 }
 }
-esp_err_t relay_enqueue(uint64_t node,uint16_t ep,bool on){
+esp_err_t relay_enqueue(uint64_t node,uint16_t ep,bool on,bool from_supla){
  if(!commands)return ESP_ERR_NO_MEM;
  if(!quick_add_device_exists(node)||!ep||ep==0xffff)return ESP_ERR_INVALID_ARG;
  if(quick_add_pairing_busy())return ESP_ERR_INVALID_STATE;
- device_telemetry::Reading proof;
- if(!device_telemetry::lookup(node,ep,device_telemetry::Metric::OnOff,proof)||!proof.valid)return ESP_ERR_NOT_SUPPORTED;
- Command command{node,ep,on};
+ if(!from_supla){
+  device_telemetry::Reading proof;
+  if(!device_telemetry::lookup(node,ep,device_telemetry::Metric::OnOff,proof)||!proof.valid)return ESP_ERR_NOT_SUPPORTED;
+ }
+ Command command{node,ep,on,false,from_supla};
  if(xQueueSend(commands,&command,0)!=pdTRUE)return ESP_ERR_TIMEOUT;
  wake_gateway_worker();
  return ESP_OK;
@@ -77,10 +79,11 @@ auto c=std::unique_ptr<Config>(new(std::nothrow)Config);if(!c){cJSON_Delete(j);r
  auto *store=cJSON_CreateObject();if(!store){return reply(r,503,"Za malo pamieci.");}
 cJSON_AddBoolToObject(store,"enabled",c->enabled);cJSON_AddStringToObject(store,"uri",c->uri);cJSON_AddStringToObject(store,"user",c->user);cJSON_AddStringToObject(store,"password",c->password);cJSON_AddStringToObject(store,"ca",c->ca);char *text=cJSON_PrintUnformatted(store);cJSON_Delete(store);nvs_handle_t h;esp_err_t e=ESP_FAIL;if(text&&nvs_open("m2s_mqtt",NVS_READWRITE,&h)==ESP_OK){e=nvs_set_str(h,"config",text);if(e==ESP_OK)e=nvs_commit(h);nvs_close(h);}if(text){memset(text,0,strlen(text));cJSON_free(text);}if(e==ESP_OK){portENTER_CRITICAL(&lock);desired=*c;++generation;portEXIT_CRITICAL(&lock);}memset(static_cast<void*>(c.get()),0,sizeof(Config));return reply(r,e==ESP_OK?200:500,e==ESP_OK?"Ustawienia MQTT zapisane. Bramka polaczy sie bez restartu.":"Nie zapisano konfiguracji MQTT.");}
 void mqtt_tick(){Command command;while(commands&&xQueueReceive(commands,&command,0)==pdTRUE){if(command.from_mqtt&&!connected.load())continue;
- const auto result=quick_add_pairing_busy()?ESP_ERR_INVALID_STATE:supla_bridge_mqtt_command(command.node,command.ep,command.on);
+ const auto result=quick_add_pairing_busy()?ESP_ERR_INVALID_STATE:supla_bridge_mqtt_command(command.node,command.ep,command.on,!command.from_supla);
  if(!command.from_mqtt) {
-  if(result==ESP_OK)ESP_LOGI("gateway_relay","WebUI OnOff=%d submitted to Matter (node %llu, ep %u)",command.on,static_cast<unsigned long long>(command.node),static_cast<unsigned>(command.ep));
-  else ESP_LOGW("gateway_relay","WebUI OnOff=%d rejected before completion (node %llu, ep %u): %s",command.on,static_cast<unsigned long long>(command.node),static_cast<unsigned>(command.ep),esp_err_to_name(result));
+  const char *origin = command.from_supla ? "SUPLA" : "WebUI";
+  if(result==ESP_OK)ESP_LOGI("gateway_relay","%s OnOff=%d submitted to Matter (node %llu, ep %u)",origin,command.on,static_cast<unsigned long long>(command.node),static_cast<unsigned>(command.ep));
+  else ESP_LOGW("gateway_relay","%s OnOff=%d rejected before completion (node %llu, ep %u): %s",origin,command.on,static_cast<unsigned long long>(command.node),static_cast<unsigned>(command.ep),esp_err_to_name(result));
  }}uint32_t gen;portENTER_CRITICAL(&lock);gen=generation;portEXIT_CRITICAL(&lock);if(gen!=applied){if(client){publish(availability,"offline");esp_mqtt_client_stop(client);esp_mqtt_client_destroy(client);client=nullptr;connected=false;}portENTER_CRITICAL(&lock);running=desired;applied=gen;portEXIT_CRITICAL(&lock);if(running.enabled){esp_mqtt_client_config_t c{};c.broker.address.uri=running.uri;c.credentials.username=running.user;c.credentials.authentication.password=running.password;c.session.last_will.topic=availability;c.session.last_will.msg="offline";c.session.last_will.qos=1;c.session.last_will.retain=1;c.outbox.limit=65536;if(!strncmp(running.uri,"mqtts://",8)){if(running.ca[0])c.broker.verification.certificate=running.ca;else c.broker.verification.crt_bundle_attach=esp_crt_bundle_attach;}client=esp_mqtt_client_init(&c);if(client){esp_mqtt_client_register_event(client,MQTT_EVENT_ANY,event,nullptr);esp_mqtt_client_start(client);}}}
  if(!client||!connected.load()){return;}
 if(rediscover.exchange(false)){for(auto &t:tracked){t.config_hash=0;t.last_publish=0;}publish(availability,"online");}

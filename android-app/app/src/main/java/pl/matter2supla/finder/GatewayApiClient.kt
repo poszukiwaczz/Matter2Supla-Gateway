@@ -1,6 +1,9 @@
 package pl.matter2supla.finder
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.BufferedReader
@@ -48,6 +51,9 @@ class GatewayApiClient(
         hostname == ip
     }
 
+    // Serialize all HTTP requests to ESP32-S3 so tab switches never open concurrent TLS sockets.
+    private val requestMutex = Mutex()
+
     suspend fun get(path: String, timeoutMs: Int = 5000): ApiResult =
         request("GET", path, null, timeoutMs)
 
@@ -91,56 +97,61 @@ class GatewayApiClient(
         path: String,
         body: String?,
         timeoutMs: Int
-    ): ApiResult = withContext(Dispatchers.IO) {
-        var conn: HttpsURLConnection? = null
-        try {
-            val url = URL("https://$ip$path")
-            conn = (url.openConnection() as HttpsURLConnection).apply {
-                sslSocketFactory = sslContext.socketFactory
-                hostnameVerifier = hostVerifier
-                requestMethod = method
-                connectTimeout = timeoutMs
-                readTimeout = timeoutMs
-                useCaches = false
-                setRequestProperty("Host", ip)
-                setRequestProperty("Origin", "https://$ip")
-                setRequestProperty("Authorization", "Bearer $credential")
-                setRequestProperty("Accept", "application/json")
-                setRequestProperty("Connection", "keep-alive")
+    ): ApiResult = requestMutex.withLock {
+        withContext(Dispatchers.IO) {
+            var conn: HttpsURLConnection? = null
+            try {
+                val url = URL("https://$ip$path")
+                conn = (url.openConnection() as HttpsURLConnection).apply {
+                    sslSocketFactory = sslContext.socketFactory
+                    hostnameVerifier = hostVerifier
+                    requestMethod = method
+                    connectTimeout = timeoutMs
+                    readTimeout = timeoutMs
+                    useCaches = false
+                    setRequestProperty("Host", ip)
+                    setRequestProperty("Origin", "https://$ip")
+                    setRequestProperty("Authorization", "Bearer $credential")
+                    setRequestProperty("Accept", "application/json")
+                    setRequestProperty("Connection", "keep-alive")
+                    if (body != null) {
+                        setRequestProperty("Content-Type", "application/json")
+                        doOutput = true
+                    }
+                }
+
                 if (body != null) {
-                    setRequestProperty("Content-Type", "application/json")
-                    doOutput = true
+                    conn.outputStream.use { os ->
+                        os.write(body.toByteArray(Charsets.UTF_8))
+                        os.flush()
+                    }
                 }
-            }
 
-            if (body != null) {
-                conn.outputStream.use { os ->
-                    os.write(body.toByteArray(Charsets.UTF_8))
-                    os.flush()
+                val statusCode = conn.responseCode
+                val stream = if (statusCode in 200..299) conn.inputStream else conn.errorStream
+                val raw = if (stream != null) {
+                    BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).use { it.readText() }
+                } else {
+                    ""
                 }
+                val parsed = try {
+                    if (raw.trim().startsWith("{")) JSONObject(raw.trim()) else null
+                } catch (_: Exception) {
+                    null
+                }
+                ApiResult(code = statusCode, json = parsed, rawBody = raw)
+            } catch (e: CancellationException) {
+                conn?.disconnect()
+                throw e
+            } catch (e: Exception) {
+                conn?.disconnect()
+                ApiResult(
+                    code = -1,
+                    json = null,
+                    rawBody = "",
+                    error = e.message ?: e.javaClass.simpleName
+                )
             }
-
-            val statusCode = conn.responseCode
-            val stream = if (statusCode in 200..299) conn.inputStream else conn.errorStream
-            val raw = if (stream != null) {
-                BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).use { it.readText() }
-            } else {
-                ""
-            }
-            val parsed = try {
-                if (raw.trim().startsWith("{")) JSONObject(raw.trim()) else null
-            } catch (_: Exception) {
-                null
-            }
-            ApiResult(code = statusCode, json = parsed, rawBody = raw)
-        } catch (e: Exception) {
-            conn?.disconnect()
-            ApiResult(
-                code = -1,
-                json = null,
-                rawBody = "",
-                error = e.message ?: e.javaClass.simpleName
-            )
         }
     }
 }

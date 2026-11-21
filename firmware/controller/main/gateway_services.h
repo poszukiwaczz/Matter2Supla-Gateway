@@ -21,7 +21,7 @@ esp_err_t rollback(httpd_req_t*);
 esp_err_t mqtt_get(httpd_req_t*);
 esp_err_t mqtt_save(httpd_req_t*);
 esp_err_t relay_control(httpd_req_t*);
-esp_err_t relay_enqueue(uint64_t,uint16_t,bool);
+esp_err_t relay_enqueue(uint64_t,uint16_t,bool,bool from_supla=false);
 void mqtt_tick();
 void wake_gateway_worker();
 void mqtt_init();

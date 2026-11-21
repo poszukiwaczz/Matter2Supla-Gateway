@@ -510,9 +510,11 @@ esp_err_t wifi_manager_scan(char *json_out, size_t out_size)
     static int64_t s_cached_scan_at_us = 0;
 
     if (xSemaphoreTake(s_mode_mutex, pdMS_TO_TICKS(250)) != pdTRUE) {
-        // Another scan or Wi-Fi transition is in progress; return cached result if available.
-        if (s_cached_scan[0] && strlen(s_cached_scan) < out_size) {
-            memcpy(json_out, s_cached_scan, strlen(s_cached_scan) + 1);
+        // Another scan or Wi-Fi transition is in progress; return cached result safely under WifiLock.
+        WifiLock cache_lock;
+        const size_t cached_len = strlen(s_cached_scan);
+        if (cached_len > 0 && cached_len < out_size) {
+            memcpy(json_out, s_cached_scan, cached_len + 1);
             return ESP_OK;
         }
         return ESP_ERR_TIMEOUT;
@@ -520,10 +522,14 @@ esp_err_t wifi_manager_scan(char *json_out, size_t out_size)
     struct ReleaseMode { ~ReleaseMode() { xSemaphoreGive(s_mode_mutex); } } release_mode;
 
     const int64_t now_us = esp_timer_get_time();
-    if (s_cached_scan[0] && s_cached_scan_at_us > 0 && (now_us - s_cached_scan_at_us) < 15LL * kSecond) {
-        if (strlen(s_cached_scan) < out_size) {
-            memcpy(json_out, s_cached_scan, strlen(s_cached_scan) + 1);
-            return ESP_OK;
+    {
+        WifiLock cache_lock;
+        const size_t cached_len = strlen(s_cached_scan);
+        if (cached_len > 0 && s_cached_scan_at_us > 0 && (now_us - s_cached_scan_at_us) < 15LL * kSecond) {
+            if (cached_len < out_size) {
+                memcpy(json_out, s_cached_scan, cached_len + 1);
+                return ESP_OK;
+            }
         }
     }
 
@@ -577,6 +583,7 @@ esp_err_t wifi_manager_scan(char *json_out, size_t out_size)
             return ESP_ERR_INVALID_SIZE;}
             memcpy(json_out,text,len+1);
             if (len < sizeof(s_cached_scan)) {
+                WifiLock cache_lock;
                 memcpy(s_cached_scan, text, len + 1);
                 s_cached_scan_at_us = esp_timer_get_time();
             }

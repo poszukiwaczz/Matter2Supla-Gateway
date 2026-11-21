@@ -260,6 +260,10 @@ object GatewayDiscovery {
                         if (json.has("supla") || json.has("thread")) {
                             apiConfirmed = true
                         }
+                        val msg = json.optString("message", "")
+                        if (msg.contains("Wymagane haslo lub token panelu", ignoreCase = true)) {
+                            apiConfirmed = true
+                        }
                     } catch (_: Exception) {
                     }
                 }

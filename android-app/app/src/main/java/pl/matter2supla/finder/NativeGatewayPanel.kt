@@ -348,6 +348,11 @@ private data class ParsedMetric(
     val isValid: Boolean
 )
 
+private data class RelayControl(
+    val endpoint: Int,
+    val isOn: Boolean?
+)
+
 @Composable
 private fun DevicesTab(
     devices: JSONArray?,
@@ -412,8 +417,7 @@ private fun DevicesTab(
                 val values = tel?.optJSONArray("values")
                 val threadInfo = tel?.optJSONObject("thread")
 
-                var relayEndpoint: Int? = null
-                var relayIsOn: Boolean? = null
+                val relayControls = mutableListOf<RelayControl>()
                 val parsedMetrics = mutableListOf<ParsedMetric>()
 
                 if (values != null) {
@@ -434,10 +438,7 @@ private fun DevicesTab(
                             "temperature" -> "Temperatura (EP$ep)"
                             "humidity" -> "Wilgotność (EP$ep)"
                             "battery" -> "Bateria (EP$ep)"
-                            "onoff", "on_off" -> {
-                                relayEndpoint = ep
-                                "Przekaźnik OnOff (EP$ep)"
-                            }
+                            "onoff", "on_off" -> "Przekaźnik OnOff (EP$ep)"
                             "voltage" -> "Napięcie (EP$ep)"
                             "current" -> "Natężenie prądu (EP$ep)"
                             "active_power" -> "Moc czynna (EP$ep)"
@@ -447,10 +448,16 @@ private fun DevicesTab(
                         }
 
                         val formatted = if (!valid || numVal.isNaN()) {
+                            if (kind == "onoff" || kind == "on_off") {
+                                if (relayControls.none { it.endpoint == ep }) {
+                                    relayControls.add(RelayControl(ep, null))
+                                }
+                            }
                             "Brak odczytu"
                         } else if (kind == "onoff" || kind == "on_off") {
                             val isOn = numVal >= 0.5 || rawStr == "1"
-                            relayIsOn = isOn
+                            relayControls.removeAll { it.endpoint == ep }
+                            relayControls.add(RelayControl(ep, isOn))
                             if (isOn) "WŁĄCZONE (ON)" else "WYŁĄCZONE (OFF)"
                         } else {
                             val formattedNum = when (kind) {
@@ -576,8 +583,9 @@ private fun DevicesTab(
                         }
                     }
 
-                    if (relayEndpoint != null) {
+                    relayControls.sortedBy { it.endpoint }.forEach { rc ->
                         Spacer(Modifier.height(10.dp))
+                        val epSuffix = if (relayControls.size > 1) " (EP${rc.endpoint})" else ""
                         Row(
                             horizontalArrangement = Arrangement.spacedBy(10.dp),
                             modifier = Modifier.fillMaxWidth()
@@ -585,8 +593,8 @@ private fun DevicesTab(
                             Button(
                                 onClick = {
                                     scope.launch {
-                                        actionFeedback = "Wysyłanie WŁĄCZ do $name (EP$relayEndpoint)..."
-                                        val r = client.controlRelay(node, relayEndpoint!!, true)
+                                        actionFeedback = "Wysyłanie WŁĄCZ do $name (EP${rc.endpoint})..."
+                                        val r = client.controlRelay(node, rc.endpoint, true)
                                         val msg = r.json?.optString("message")?.ifEmpty { null }
                                         actionFeedback = if (r.isOk) (msg ?: "Wysłano WŁĄCZ ($name).") else "Błąd: ${msg ?: r.error ?: r.code}"
                                         delay(1500)
@@ -594,21 +602,21 @@ private fun DevicesTab(
                                     }
                                 },
                                 colors = ButtonDefaults.buttonColors(
-                                    containerColor = if (relayIsOn == true) AccentGreen else Color(0xFF1F4E38)
+                                    containerColor = if (rc.isOn == true) AccentGreen else Color(0xFF1F4E38)
                                 ),
                                 modifier = Modifier.weight(1f)
                             ) {
                                 Text(
-                                    text = "Włącz (ON)",
-                                    color = if (relayIsOn == true) Color(0xFF062111) else Color(0xFFF4F7FB),
+                                    text = "Włącz$epSuffix",
+                                    color = if (rc.isOn == true) Color(0xFF062111) else Color(0xFFF4F7FB),
                                     fontWeight = FontWeight.SemiBold
                                 )
                             }
                             OutlinedButton(
                                 onClick = {
                                     scope.launch {
-                                        actionFeedback = "Wysyłanie WYŁĄCZ do $name (EP$relayEndpoint)..."
-                                        val r = client.controlRelay(node, relayEndpoint!!, false)
+                                        actionFeedback = "Wysyłanie WYŁĄCZ do $name (EP${rc.endpoint})..."
+                                        val r = client.controlRelay(node, rc.endpoint, false)
                                         val msg = r.json?.optString("message")?.ifEmpty { null }
                                         actionFeedback = if (r.isOk) (msg ?: "Wysłano WYŁĄCZ ($name).") else "Błąd: ${msg ?: r.error ?: r.code}"
                                         delay(1500)
@@ -617,7 +625,7 @@ private fun DevicesTab(
                                 },
                                 modifier = Modifier.weight(1f)
                             ) {
-                                Text("Wyłącz (OFF)")
+                                Text("Wyłącz$epSuffix")
                             }
                         }
                     }

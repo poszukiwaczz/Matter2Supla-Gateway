@@ -54,13 +54,17 @@ constexpr uint32_t kCrashMagic = 0x4D325347U; // "M2SG"
 
 void init_crash_breadcrumb() {
  const int reason = static_cast<int>(esp_reset_reason());
+ const bool is_abnormal = (reason == ESP_RST_PANIC || reason == ESP_RST_INT_WDT ||
+                           reason == ESP_RST_TASK_WDT || reason == ESP_RST_WDT);
  if (s_rtc_crash.magic != kCrashMagic) {
   s_rtc_crash = {kCrashMagic, 1, 0, 0, 0, 0};
  } else {
   ++s_rtc_crash.boot_count;
-  s_rtc_crash.last_uptime_before_reset_s = s_rtc_crash.current_uptime_s;
+  if (is_abnormal) {
+   s_rtc_crash.last_uptime_before_reset_s = s_rtc_crash.current_uptime_s;
+  }
  }
- if (reason == ESP_RST_PANIC || reason == ESP_RST_INT_WDT || reason == ESP_RST_TASK_WDT || reason == ESP_RST_WDT) {
+ if (is_abnormal) {
   ++s_rtc_crash.panic_count;
   s_rtc_crash.last_abnormal_reason = reason;
  }

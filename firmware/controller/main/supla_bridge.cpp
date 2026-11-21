@@ -178,7 +178,7 @@ class MatterRelayElement : public Supla::Control::VirtualRelay {
     state = confirmed_state_;
     if (endpoint_ == m2s::mapping::kNone || !quick_add_device_exists(node_)) return;
     const bool on = value;
-    esp_err_t err = gateway::relay_enqueue(node_, endpoint_, on);
+    esp_err_t err = gateway::relay_enqueue(node_, endpoint_, on, true);
     if (err == ESP_OK) {
       ESP_LOGI(TAG, "Supla -> Matter (queued): OnOff=%d (node %llu, ep %u)",
                on ? 1 : 0, (unsigned long long)node_, (unsigned)endpoint_);
@@ -1177,10 +1177,12 @@ static void read_relay_after_command(uint64_t node, uint16_t endpoint)
   }
 }
 
-extern "C" esp_err_t supla_bridge_mqtt_command(uint64_t node,uint16_t ep,bool on){
+extern "C" esp_err_t supla_bridge_mqtt_command(uint64_t node,uint16_t ep,bool on,bool require_proof=true){
  if(!quick_add_device_exists(node)||ep==0||ep==0xffff)return ESP_ERR_INVALID_ARG;
- device_telemetry::Reading proof;
- if(!device_telemetry::lookup(node,ep,device_telemetry::Metric::OnOff,proof)||!proof.valid)return ESP_ERR_INVALID_ARG;
+ if(require_proof){
+  device_telemetry::Reading proof;
+  if(!device_telemetry::lookup(node,ep,device_telemetry::Metric::OnOff,proof)||!proof.valid)return ESP_ERR_INVALID_ARG;
+ }
  esp_matter::lock::ScopedChipStackLock lock(portMAX_DELAY);
  using esp_matter::controller::cluster_command;
  auto *command = chip::Platform::New<cluster_command>(

@@ -176,6 +176,7 @@ private fun CameraQrPreview(onResult: (String) -> Unit) {
                 }
                 val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
                 cameraProviderFuture.addListener({
+                    if (executor.isShutdown) return@addListener
                     try {
                         val cameraProvider = cameraProviderFuture.get()
                         val preview = Preview.Builder().build().also {
