@@ -27,9 +27,18 @@ struct AccessRecord {
     unsigned char salt[16];
     unsigned char digest[32];
 };
+struct AccessRecordV2 {
+    uint32_t version;
+    uint32_t iterations;
+    unsigned char salt[16];
+    unsigned char digest[32];
+};
+constexpr uint32_t kPbkdf2Iterations = 10000;
 AccessRecord access_record{};
+AccessRecordV2 access_record_v2{};
 bool password_configured=false;
-bool password_digest(const char *password,const AccessRecord &access,unsigned char out[32]) {
+bool password_v2=false;
+bool password_digest_v1(const char *password,const AccessRecord &access,unsigned char out[32]) {
     unsigned char input[80]{};
     size_t length=strlen(password),written=0;
     if(length>64)return false;
@@ -38,6 +47,41 @@ bool password_digest(const char *password,const AccessRecord &access,unsigned ch
     psa_status_t result=psa_hash_compute(PSA_ALG_SHA_256,input,16+length,out,32,&written);
     memset(input,0,sizeof(input));
     return result==PSA_SUCCESS && written==32;
+}
+bool hmac_sha256(const unsigned char key_block[64],const unsigned char *msg,size_t msg_len,unsigned char out[32]) {
+    if(msg_len>36)return false;
+    unsigned char inner[64+36]{},outer[64+32]{},inner_hash[32]{};
+    for(size_t i=0;i<64;i++){inner[i]=key_block[i]^0x36;outer[i]=key_block[i]^0x5c;}
+    memcpy(inner+64,msg,msg_len);
+    size_t w1=0,w2=0;
+    bool ok=psa_hash_compute(PSA_ALG_SHA_256,inner,64+msg_len,inner_hash,32,&w1)==PSA_SUCCESS && w1==32;
+    if(ok){
+        memcpy(outer+64,inner_hash,32);
+        ok=psa_hash_compute(PSA_ALG_SHA_256,outer,96,out,32,&w2)==PSA_SUCCESS && w2==32;
+    }
+    memset(inner,0,sizeof(inner));memset(outer,0,sizeof(outer));memset(inner_hash,0,sizeof(inner_hash));
+    return ok;
+}
+bool password_digest_pbkdf2(const char *password,const unsigned char salt[16],uint32_t iterations,unsigned char out[32]) {
+    size_t length=strlen(password);
+    if(length>64 || iterations<1000 || iterations>100000)return false;
+    unsigned char key_block[64]{};
+    memcpy(key_block,password,length);
+    unsigned char salt_block[20]{};
+    memcpy(salt_block,salt,16);
+    salt_block[19]=1;
+    unsigned char u[32]{},t[32]{};
+    bool ok=hmac_sha256(key_block,salt_block,sizeof(salt_block),u);
+    if(ok){
+        memcpy(t,u,32);
+        for(uint32_t i=1;i<iterations && ok;++i){
+            ok=hmac_sha256(key_block,u,32,u);
+            for(size_t j=0;j<32;++j)t[j]^=u[j];
+        }
+    }
+    if(ok)memcpy(out,t,32);
+    memset(key_block,0,sizeof(key_block));memset(u,0,sizeof(u));memset(t,0,sizeof(t));
+    return ok;
 }
 void random_hex(char *out, size_t bytes) {
     static const char hex[] = "0123456789abcdef";
@@ -150,14 +194,28 @@ esp_err_t panel_security_init() {
     // Separate optional record; never overwrite the TLS/AP identity or legacy token.
     err=nvs_open("panel_sec",NVS_READONLY,&nvs);
     if(err!=ESP_OK)return err;
-    size=sizeof(access_record);
-    err=nvs_get_blob(nvs,"access_v1",&access_record,&size);
-    nvs_close(nvs);
-    if(err==ESP_ERR_NVS_NOT_FOUND)password_configured=false;
-    else if(err!=ESP_OK)return err;
-    else {
-        if(size!=sizeof(access_record) || access_record.version!=1)return ESP_ERR_INVALID_STATE;
+    size=sizeof(access_record_v2);
+    err=nvs_get_blob(nvs,"access_v2",&access_record_v2,&size);
+    if(err==ESP_OK){
+        nvs_close(nvs);
+        if(size!=sizeof(access_record_v2) || access_record_v2.version!=2 ||
+           access_record_v2.iterations<1000 || access_record_v2.iterations>100000)return ESP_ERR_INVALID_STATE;
         password_configured=true;
+        password_v2=true;
+    } else if(err==ESP_ERR_NVS_NOT_FOUND){
+        size=sizeof(access_record);
+        err=nvs_get_blob(nvs,"access_v1",&access_record,&size);
+        nvs_close(nvs);
+        if(err==ESP_ERR_NVS_NOT_FOUND){password_configured=false;password_v2=false;}
+        else if(err!=ESP_OK)return err;
+        else {
+            if(size!=sizeof(access_record) || access_record.version!=1)return ESP_ERR_INVALID_STATE;
+            password_configured=true;
+            password_v2=false;
+        }
+    } else {
+        nvs_close(nvs);
+        return err;
     }
     mbedtls_x509_crt crt;
     mbedtls_x509_crt_init(&crt);
@@ -197,11 +255,18 @@ bool panel_security_authorize(httpd_req_t *req,bool mutation,bool plain_body) {
        strncmp(authorization,"Bearer ",7)!=0)
         return deny(req,"401 Unauthorized","{\"ok\":false,\"message\":\"Wymagane haslo lub token panelu.\"}");
     static uint32_t s_failed_attempts = 0;
+    static uint32_t s_lockout_level = 0;
     static int64_t s_lockout_until_us = 0;
+    static bool s_boot_key_ready = false;
+    static unsigned char s_boot_key[16]{};
+    static bool s_verified_cache_valid = false;
+    static unsigned char s_verified_cache[32]{};
+    static uint32_t s_verified_cache_gen = 0;
+    static uint32_t s_password_gen = 1;
     const int64_t now_us = esp_timer_get_time();
     if (s_lockout_until_us > now_us) {
         memset(authorization, 0, sizeof(authorization));
-        return deny(req, "429 Too Many Requests", "{\"ok\":false,\"message\":\"Zbyt wiele blednych prob logowania. Odczekaj 3 sekundy.\"}");
+        return deny(req, "429 Too Many Requests", "{\"ok\":false,\"message\":\"Zbyt wiele blednych prob logowania. Odczekaj przed kolejna proba.\"}");
     }
     const char *credential=authorization+7;
     bool accepted=false;
@@ -211,12 +276,56 @@ bool panel_security_authorize(httpd_req_t *req,bool mutation,bool plain_body) {
         accepted=diff==0;
     }
     if(!accepted && password_configured) {
-        unsigned char digest[32]{},diff=0;
-        if(password_digest(credential,access_record,digest)) {
-            for(size_t i=0;i<32;i++)diff|=digest[i]^access_record.digest[i];
+        if(!s_boot_key_ready){esp_fill_random(s_boot_key,sizeof(s_boot_key));s_boot_key_ready=true;}
+        unsigned char cache_digest[32]{};
+        AccessRecord cache_ctx{};
+        memcpy(cache_ctx.salt,s_boot_key,16);
+        const bool have_cache_digest=password_digest_v1(credential,cache_ctx,cache_digest);
+        if(have_cache_digest && s_verified_cache_valid && s_verified_cache_gen==s_password_gen) {
+            unsigned char diff=0;
+            for(size_t i=0;i<32;i++)diff|=cache_digest[i]^s_verified_cache[i];
             accepted=diff==0;
         }
-        memset(digest,0,sizeof(digest));
+        if(!accepted) {
+            unsigned char digest[32]{},diff=0;
+            if(password_v2) {
+                if(password_digest_pbkdf2(credential,access_record_v2.salt,access_record_v2.iterations,digest)) {
+                    for(size_t i=0;i<32;i++)diff|=digest[i]^access_record_v2.digest[i];
+                    accepted=diff==0;
+                }
+            } else {
+                if(password_digest_v1(credential,access_record,digest)) {
+                    for(size_t i=0;i<32;i++)diff|=digest[i]^access_record.digest[i];
+                    accepted=diff==0;
+                    if(accepted) {
+                        // Transparently migrate legacy SHA-256 password to PBKDF2-HMAC-SHA256.
+                        AccessRecordV2 migrated{};
+                        migrated.version=2;
+                        migrated.iterations=kPbkdf2Iterations;
+                        esp_fill_random(migrated.salt,sizeof(migrated.salt));
+                        if(password_digest_pbkdf2(credential,migrated.salt,migrated.iterations,migrated.digest)) {
+                            nvs_handle_t nvs;
+                            if(nvs_open("panel_sec",NVS_READWRITE,&nvs)==ESP_OK) {
+                                if(nvs_set_blob(nvs,"access_v2",&migrated,sizeof(migrated))==ESP_OK && nvs_commit(nvs)==ESP_OK) {
+                                    nvs_erase_key(nvs,"access_v1");
+                                    nvs_commit(nvs);
+                                    access_record_v2=migrated;
+                                    password_v2=true;
+                                }
+                                nvs_close(nvs);
+                            }
+                        }
+                    }
+                }
+            }
+            memset(digest,0,sizeof(digest));
+            if(accepted && have_cache_digest) {
+                memcpy(s_verified_cache,cache_digest,32);
+                s_verified_cache_gen=s_password_gen;
+                s_verified_cache_valid=true;
+            }
+        }
+        memset(cache_digest,0,sizeof(cache_digest));
     }
     // admin is a restricted first-setup credential, never general API access.
     if(!accepted && !password_configured && strcmp(credential,"admin")==0) {
@@ -227,16 +336,21 @@ bool panel_security_authorize(httpd_req_t *req,bool mutation,bool plain_body) {
     memset(authorization,0,sizeof(authorization));
     if(!accepted) {
         if (++s_failed_attempts >= 5) {
-            s_lockout_until_us = now_us + 3000000LL;
+            static constexpr int64_t kLockoutUs[] = {5000000LL, 15000000LL, 45000000LL, 120000000LL, 300000000LL};
+            const size_t idx = s_lockout_level < 5 ? s_lockout_level : 4;
+            s_lockout_until_us = now_us + kLockoutUs[idx];
+            if (s_lockout_level < 4) ++s_lockout_level;
             s_failed_attempts = 0;
         }
         return deny(req,"401 Unauthorized","{\"ok\":false,\"message\":\"Nieprawidlowe haslo lub token panelu.\"}");
     }
     s_failed_attempts = 0;
+    s_lockout_level = 0;
+    if(strcmp(req->uri,"/api/panel/password")==0)++s_password_gen;
     if (mutation) {
         char type[80];
-        // The binary MIME exception belongs only to the authenticated OTA route.
-        const bool ota_binary=strcmp(req->uri,"/api/gateway/update")==0;
+        // The binary MIME exception belongs only to authenticated OTA routes (S3 & C6 RCP).
+        const bool ota_binary=strcmp(req->uri,"/api/gateway/update")==0 || strcmp(req->uri,"/api/gateway/update-rcp")==0;
         const char *expected=ota_binary?"application/octet-stream":(plain_body?"text/plain":"application/json");
         if (!header(req,"Content-Type",type,sizeof(type))) return deny(req,"415 Unsupported Media Type","{\"ok\":false,\"message\":\"Nieprawidlowy typ danych.\"}");
         char *semicolon=strchr(type,';');
@@ -262,17 +376,19 @@ esp_err_t panel_security_change_password(const char *password) {
         if((unsigned char)password[i]<33 || (unsigned char)password[i]>126)return ESP_ERR_INVALID_ARG;
     // Keep the console recovery token distinct from the configurable password.
     if(strcmp(password,record.token)==0)return ESP_ERR_INVALID_ARG;
-    AccessRecord next{};
-    next.version=1;
+    AccessRecordV2 next{};
+    next.version=2;
+    next.iterations=kPbkdf2Iterations;
     esp_fill_random(next.salt,sizeof(next.salt));
-    if(!password_digest(password,next,next.digest))return ESP_FAIL;
+    if(!password_digest_pbkdf2(password,next.salt,next.iterations,next.digest))return ESP_FAIL;
     nvs_handle_t nvs;
     esp_err_t err=nvs_open("panel_sec",NVS_READWRITE,&nvs);
     if(err!=ESP_OK)return err;
-    err=nvs_set_blob(nvs,"access_v1",&next,sizeof(next));
+    err=nvs_set_blob(nvs,"access_v2",&next,sizeof(next));
     if(err==ESP_OK)err=nvs_commit(nvs);
+    if(err==ESP_OK){nvs_erase_key(nvs,"access_v1");nvs_commit(nvs);}
     nvs_close(nvs);
-    if(err==ESP_OK){access_record=next;password_configured=true;}
+    if(err==ESP_OK){access_record_v2=next;password_configured=true;password_v2=true;}
     return err;
 }
 

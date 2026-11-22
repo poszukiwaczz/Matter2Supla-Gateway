@@ -18,6 +18,8 @@
 #include <openthread/platform/radio.h>
 #include <esp_log.h>
 #include "radio_health.h"
+#include "device_telemetry.h"
+#include <esp_netif.h>
 #include <openthread/link.h>
 #include <openthread/thread.h>
 #include <openthread/dataset.h>
@@ -152,6 +154,17 @@ void add_cpu_diagnostics(cJSON *j, int64_t now)
 #endif
 
 std::atomic<TaskHandle_t> gateway_worker{nullptr};
+char s_boot_faults[160]="";
+std::atomic<bool> s_boot_faulted{false};
+bool wifi_has_ip(){
+ esp_netif_ip_info_t ip{};auto *sta=esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+ return sta&&esp_netif_is_netif_up(sta)&&esp_netif_get_ip_info(sta,&ip)==ESP_OK&&ip.ip.addr!=0;
+}
+bool services_ok(){
+ if(!strcmp(supla_bridge_state_name(),"connected"))return true;
+ if(device_telemetry::active_subscriptions()>0)return true;
+ return !strcmp(supla_bridge_state_name(),"not_configured")&&quick_add_devices_count()==0;
+}
 void work(void*){gateway_worker.store(xTaskGetCurrentTaskHandle());int64_t next=0;for(;;){const auto now=esp_timer_get_time();
  s_rtc_crash.current_uptime_s = static_cast<uint32_t>(now / 1000000);
  if(now>=next){Radio r;portENTER_CRITICAL(&guard);r=radio;portEXIT_CRITICAL(&guard);r.tried=now;
@@ -159,13 +172,20 @@ void work(void*){gateway_worker.store(xTaskGetCurrentTaskHandle());int64_t next=
    if(r.result==ESP_OK){r.good=esp_timer_get_time();r.consecutive_failed=0;const char *v=otPlatRadioGetVersionString(esp_openthread_get_instance());snprintf(r.version,sizeof(r.version),"%s",v?v:"");}
    else {++r.failed;++r.consecutive_failed;}
    auto *c=otLinkGetCounters(esp_openthread_get_instance());if(c){r.tx_delta=c->mTxTotal-r.tx;r.tx=c->mTxTotal;r.cca_delta=c->mTxErrCca-r.cca;r.cca=c->mTxErrCca;r.blocked=radio_blocked(r.tx_delta,r.cca_delta);if(r.blocked)++r.consecutive_cca_blocked;else r.consecutive_cca_blocked=0;r.rx_errors=c->mRxErrFcs+c->mRxErrSec;}
-   esp_openthread_lock_release();}else r.result=ESP_ERR_TIMEOUT;
+   esp_openthread_lock_release();}else{r.result=ESP_ERR_TIMEOUT;++r.failed;++r.consecutive_failed;}
   r.watchdog_alert = (r.consecutive_cca_blocked >= 3 || r.consecutive_failed >= 3);
   static int64_t warning=0;if((r.blocked || r.watchdog_alert)&&(!warning||now-warning>=60000000)){ESP_LOGW("gateway_health","RF/C6 watchdog: TX window=%lu CCA window=%lu (consec_cca=%lu consec_fail=%lu); RCP query=%d.",(unsigned long)r.tx_delta,(unsigned long)r.cca_delta,(unsigned long)r.consecutive_cca_blocked,(unsigned long)r.consecutive_failed,r.result);warning=now;}
   portENTER_CRITICAL(&guard);radio=r;portEXIT_CRITICAL(&guard);next=now+15000000;}
- Radio r;portENTER_CRITICAL(&guard);r=radio;portEXIT_CRITICAL(&guard);ota_health(r.good&&now-r.good<45000000&&heap_caps_get_free_size(MALLOC_CAP_INTERNAL)>8192);
+ Radio r;portENTER_CRITICAL(&guard);r=radio;portEXIT_CRITICAL(&guard);{const bool core=heap_caps_get_free_size(MALLOC_CAP_INTERNAL)>16384&&!boot_faulted()&&wifi_has_ip();ota_health(core,core&&services_ok(),r.good&&now-r.good<45000000);}
  mqtt_tick();ulTaskNotifyTake(pdTRUE,pdMS_TO_TICKS(2000));}}
 }
+void note_boot_fault(const char *stage,esp_err_t err){
+ ESP_LOGE("gateway_boot","Startup fault in %s: %s (0x%x); continuing in limited mode",stage,esp_err_to_name(err),(unsigned)err);
+ const size_t used=strlen(s_boot_faults);
+ snprintf(s_boot_faults+used,sizeof(s_boot_faults)-used,"%s%s:%s",used?", ":"",stage,esp_err_to_name(err));
+ s_boot_faulted.store(true);
+}
+bool boot_faulted(){return s_boot_faulted.load();}
 void wake_gateway_worker()
 {
     if (auto task = gateway_worker.load()) xTaskNotifyGive(task);
@@ -416,6 +436,7 @@ Radio r;portENTER_CRITICAL(&guard);r=radio;portEXIT_CRITICAL(&guard);const auto 
  auto *storage=cJSON_AddObjectToObject(j,"flash");if(flash.physical)cJSON_AddNumberToObject(storage,"physical_bytes",flash.physical);else cJSON_AddNullToObject(storage,"physical_bytes");if(flash.physical)cJSON_AddNumberToObject(storage,"unassigned_bytes",flash.unassigned);else cJSON_AddNullToObject(storage,"unassigned_bytes");cJSON_AddStringToObject(storage,"running_partition",flash.label);cJSON_AddNumberToObject(storage,"app_partition_bytes",flash.app_size);if(flash.image_known){cJSON_AddNumberToObject(storage,"app_image_bytes",flash.app_image);cJSON_AddNumberToObject(storage,"app_partition_unused_bytes",flash.app_size-flash.app_image);}else{cJSON_AddNullToObject(storage,"app_image_bytes");cJSON_AddNullToObject(storage,"app_partition_unused_bytes");}
 
  auto *rcp=cJSON_AddObjectToObject(j,"s3_c6");cJSON_AddStringToObject(rcp,"transport","UART1 2000000 8N1 over USB connector pins");cJSON_AddStringToObject(rcp,"probe","Spinel GET PHY_TX_POWER response");cJSON_AddBoolToObject(rcp,"connected",r.result==ESP_OK&&r.good&&now-r.good<45000000);if(r.good)cJSON_AddNumberToObject(rcp,"last_success_age_s",(now-r.good)/1000000);else cJSON_AddNullToObject(rcp,"last_success_age_s");cJSON_AddStringToObject(rcp,"rcp_version",r.version);cJSON_AddNumberToObject(rcp,"probe_failures",r.failed);cJSON_AddNumberToObject(rcp,"consecutive_probe_failures",r.consecutive_failed);cJSON_AddNumberToObject(rcp,"last_result",r.result);cJSON_AddBoolToObject(rcp,"radio_access_blocked",r.blocked);cJSON_AddNumberToObject(rcp,"consecutive_cca_blocked_windows",r.consecutive_cca_blocked);cJSON_AddBoolToObject(rcp,"watchdog_alert",r.watchdog_alert);cJSON_AddNumberToObject(rcp,"radio_tx_total",r.tx);cJSON_AddNumberToObject(rcp,"radio_tx_since_last_probe",r.tx_delta);cJSON_AddNumberToObject(rcp,"radio_cca_total",r.cca);cJSON_AddNumberToObject(rcp,"radio_cca_since_last_probe",r.cca_delta);cJSON_AddNumberToObject(rcp,"radio_rx_errors_total",r.rx_errors);
+ cJSON_AddBoolToObject(j,"limited_mode",boot_faulted());cJSON_AddStringToObject(j,"boot_faults",s_boot_faults);
  if(auto *cg=cJSON_AddObjectToObject(j,"crash_guard")){
   cJSON_AddNumberToObject(cg,"boot_count",s_rtc_crash.boot_count);
   cJSON_AddNumberToObject(cg,"panic_count",s_rtc_crash.panic_count);

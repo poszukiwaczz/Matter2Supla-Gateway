@@ -16,8 +16,10 @@ extern "C" {
  *
  * Wywolywane z app_main() po starcie Matter/OTBR.
  */
+void quick_add_init_locks(void);
 void quick_add_start(void);
 bool quick_add_pairing_busy(void);
+unsigned int quick_add_devices_count(void);
 
 /* Rejestr urzadzen (dla warstwy Supla): kopiuje node_id do bufora,
  * zwraca liczbe skopiowanych pozycji. */

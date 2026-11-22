@@ -226,7 +226,7 @@ static esp_err_t start_sta_locked(bool keep_ap)
       memcpy(sta_cfg.sta.ssid,s_sta_ssid,strlen(s_sta_ssid));
       memcpy(sta_cfg.sta.password,s_sta_pass,strlen(s_sta_pass));
     }
-    sta_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    sta_cfg.sta.threshold.authmode = sta_cfg.sta.password[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
 
     s_got_ip_pending=false;
     ++s_link_generation;

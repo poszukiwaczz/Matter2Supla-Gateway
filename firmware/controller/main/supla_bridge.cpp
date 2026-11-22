@@ -837,9 +837,13 @@ static void poll_task(void *)
 
 static void drain_mapped(const mapping::Model &model)
 {
+  static uint32_t s_last_sweep = 0;
+  static bool s_sweep_done = false;
   Update update;
   const uint32_t now = millis();
+  bool had_updates = false;
   while (dequeue_update(&update)) {
+    had_updates = true;
     if (!quick_add_device_exists(update.node)) continue;
     const auto role = static_cast<mapping::Role>(
         update.kind >= UPD_ELECTRICAL ? update.kind - UPD_ELECTRICAL : update.kind - 1);
@@ -872,6 +876,11 @@ static void drain_mapped(const mapping::Model &model)
       element.therm->setHumiFromMatter(element.seen[field] ? update.value : HUMIDITY_NOT_AVAILABLE);
     }
   }
+  if (!had_updates && s_sweep_done && uint32_t(now - s_last_sweep) < 1000) {
+    return;
+  }
+  s_last_sweep = now;
+  s_sweep_done = true;
   for (size_t i = 0; i < model.count; ++i) {
     const auto &binding = model.channels[i];
     auto &element = s_mapped_elements[i];
@@ -903,8 +912,12 @@ static void drain_updates(void)
     drain_mapped(*model);
     return;
   }
+  static uint32_t s_last_legacy_sweep = 0;
+  static bool s_legacy_sweep_done = false;
   Update update;
+  bool had_updates = false;
   while (dequeue_update(&update)) {
+    had_updates = true;
     if(!quick_add_device_exists(update.node))continue;
     ElemSlot *slot=nullptr;
     if(!std::isfinite(update.value)){for(size_t i=0;i<s_slot_count;i++)if(s_slots[i].node==update.node&&s_slots[i].endpoint==update.endpoint)slot=&s_slots[i];}
@@ -939,19 +952,23 @@ static void drain_updates(void)
   }
 
   const uint32_t now = millis();
-  for (size_t i = 0; i < s_slot_count; ++i) {
-    auto &slot = s_slots[i];
+  if (had_updates || !s_legacy_sweep_done || uint32_t(now - s_last_legacy_sweep) >= 1000) {
+    s_last_legacy_sweep = now;
+    s_legacy_sweep_done = true;
+    for (size_t i = 0; i < s_slot_count; ++i) {
+      auto &slot = s_slots[i];
 
-    const bool registered=quick_add_device_exists(slot.node);
-    const bool reporting=reporting_fresh(slot.node,now);
-    if(slot.relay&&(!registered||!slot.relay_updated||(!reporting&&(uint32_t)(now-slot.relay_updated)>180000)))slot.relay->getChannel()->setStateOffline();
-    if(slot.therm){
-      bool temperature=registered&&slot.temp_updated&&(reporting||(uint32_t)(now-slot.temp_updated)<=900000);
-      bool humidity=registered&&slot.hum_updated&&(reporting||(uint32_t)(now-slot.hum_updated)<=900000);
-      if(!temperature)slot.therm->setTempFromMatter(TEMPERATURE_NOT_AVAILABLE);
-      if(!humidity)slot.therm->setHumiFromMatter(HUMIDITY_NOT_AVAILABLE);
-      if(temperature||humidity)slot.therm->getChannel()->setStateOnline();
-      else slot.therm->getChannel()->setStateOffline();
+      const bool registered=quick_add_device_exists(slot.node);
+      const bool reporting=reporting_fresh(slot.node,now);
+      if(slot.relay&&(!registered||!slot.relay_updated||(!reporting&&(uint32_t)(now-slot.relay_updated)>180000)))slot.relay->getChannel()->setStateOffline();
+      if(slot.therm){
+        bool temperature=registered&&slot.temp_updated&&(reporting||(uint32_t)(now-slot.temp_updated)<=900000);
+        bool humidity=registered&&slot.hum_updated&&(reporting||(uint32_t)(now-slot.hum_updated)<=900000);
+        if(!temperature)slot.therm->setTempFromMatter(TEMPERATURE_NOT_AVAILABLE);
+        if(!humidity)slot.therm->setHumiFromMatter(HUMIDITY_NOT_AVAILABLE);
+        if(temperature||humidity)slot.therm->getChannel()->setStateOnline();
+        else slot.therm->getChannel()->setStateOffline();
+      }
     }
   }
 

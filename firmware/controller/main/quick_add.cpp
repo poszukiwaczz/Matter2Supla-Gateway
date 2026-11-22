@@ -32,6 +32,7 @@
 #include "input_validation.h"
 #include "version.h"
 
+#include <esp_attr.h>
 #include <esp_err.h>
 #include <esp_http_server.h>
 #include <esp_log.h>
@@ -179,8 +180,9 @@ uint32_t count;
 device_entry_t entries[MAX_DEVICES];};
 device_entry_t s_devices[MAX_DEVICES]{};
 size_t s_devices_count=0;
-StaticSemaphore_t s_devices_mutex_storage,s_devices_writer_storage;
+DRAM_ATTR StaticSemaphore_t s_devices_mutex_storage,s_devices_writer_storage;
 SemaphoreHandle_t s_devices_mutex=nullptr,s_devices_writer=nullptr;
+bool s_registry_readonly=false;
 struct RegistryLock {SemaphoreHandle_t lock;
 RegistryLock(SemaphoreHandle_t m):lock(m){xSemaphoreTake(lock,portMAX_DELAY);}~RegistryLock(){xSemaphoreGive(lock);}};
 void devices_snapshot(DeviceRegistry *out) {
@@ -196,6 +198,7 @@ bool devices_contains(uint64_t node){RegistryLock lock(s_devices_mutex);
 for(size_t i=0;i<s_devices_count;i++)if(s_devices[i].node==node)return true;
 return false;}
 esp_err_t devices_persist(const DeviceRegistry &snapshot) {
+    if(s_registry_readonly)return ESP_ERR_INVALID_STATE;
     nvs_handle_t h;
     esp_err_t err=nvs_open("panel",NVS_READWRITE,&h);
     if(err!=ESP_OK)return err;
@@ -295,6 +298,7 @@ esp_err_t devices_change(uint64_t node,const char *name,bool remove) {
     return devices_persist(*next);
 }
 esp_err_t reserve_next_id(uint32_t *out) {
+    if(s_registry_readonly)return ESP_ERR_INVALID_STATE;
     RegistryLock writer(s_devices_writer);
     uint64_t high=0;
     esp_err_t err=supla_bridge_max_reserved_node(&high);
@@ -925,34 +929,48 @@ void schedule_restart(uint32_t delay_ms)
 
 esp_err_t send_devices(httpd_req_t *req, bool include_telemetry)
 {
-    cJSON *root = cJSON_CreateObject();
-    cJSON *arr = cJSON_CreateArray();
-    if (!root || !arr) {
-        cJSON_Delete(root);
-        cJSON_Delete(arr);
-        return send_json(req, "500 Internal Server Error", "{\"ok\":false,\"message\":\"Brak pamieci.\"}");
+    auto snapshot = std::unique_ptr<DeviceRegistry>(new(std::nothrow) DeviceRegistry{});
+    if (!snapshot) {
+        return send_json(req, "503 Service Unavailable", "{\"ok\":false,\"message\":\"Brak pamieci.\"}");
     }
-    cJSON_AddItemToObject(root, "devices", arr);
-    DeviceRegistry snapshot{};
-    devices_snapshot(&snapshot);
-    for (size_t i = 0; i < snapshot.count; i++) {
+    devices_snapshot(snapshot.get());
+    httpd_resp_set_status(req, "200 OK");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    esp_err_t ret = httpd_resp_sendstr_chunk(req, "{\"devices\":[");
+    bool first = true;
+    for (size_t i = 0; ret == ESP_OK && i < snapshot->count; i++) {
         cJSON *o = cJSON_CreateObject();
         if (!o) {
+            ret = ESP_ERR_NO_MEM;
             break;
         }
-        cJSON_AddNumberToObject(o, "node", (double)snapshot.entries[i].node);
-        cJSON_AddStringToObject(o, "name", snapshot.entries[i].name);
-        cJSON_AddNumberToObject(o, "vid", snapshot.entries[i].vid);
-        cJSON_AddNumberToObject(o, "pid", snapshot.entries[i].pid);
-        if (include_telemetry) device_telemetry::append_json(snapshot.entries[i].node,o);
-        cJSON_AddItemToArray(arr, o);
+        cJSON_AddNumberToObject(o, "node", (double)snapshot->entries[i].node);
+        cJSON_AddStringToObject(o, "name", snapshot->entries[i].name);
+        cJSON_AddNumberToObject(o, "vid", snapshot->entries[i].vid);
+        cJSON_AddNumberToObject(o, "pid", snapshot->entries[i].pid);
+        if (include_telemetry) device_telemetry::append_json(snapshot->entries[i].node, o);
+        char *item = cJSON_PrintUnformatted(o);
+        cJSON_Delete(o);
+        if (!item) {
+            ret = ESP_ERR_NO_MEM;
+            break;
+        }
+        if (!first) {
+            ret = httpd_resp_send_chunk(req, ",", 1);
+        }
+        if (ret == ESP_OK) {
+            ret = httpd_resp_sendstr_chunk(req, item);
+            first = false;
+        }
+        cJSON_free(item);
     }
-    char *text = cJSON_PrintUnformatted(root);
-    esp_err_t ret = send_json(req, text ? "200 OK" : "500 Internal Server Error", text ? text : "{\"ok\":false}");
-    if (text) {
-        free(text);
+    if (ret == ESP_OK) {
+        ret = httpd_resp_sendstr_chunk(req, "]}");
     }
-    cJSON_Delete(root);
+    if (ret == ESP_OK) {
+        ret = httpd_resp_send_chunk(req, nullptr, 0);
+    }
     return ret;
 }
 
@@ -1658,14 +1676,23 @@ extern "C" bool quick_add_device_metadata(uint64_t node,const char *product,cons
     return false; // A delayed read must never resurrect a removed device.
 }
 
+extern "C" void quick_add_init_locks(void) {
+    if(!s_devices_mutex)s_devices_mutex=xSemaphoreCreateMutexStatic(&s_devices_mutex_storage);
+    if(!s_devices_writer)s_devices_writer=xSemaphoreCreateMutexStatic(&s_devices_writer_storage);
+}
+extern "C" unsigned int quick_add_devices_count(void) {
+    RegistryLock lock(s_devices_mutex);
+    return (unsigned int)s_devices_count;
+}
 extern "C" void quick_add_start(void) {
     s_lock=xSemaphoreCreateMutex();
-    s_devices_mutex=xSemaphoreCreateMutexStatic(&s_devices_mutex_storage);
-    s_devices_writer=xSemaphoreCreateMutexStatic(&s_devices_writer_storage);
+    quick_add_init_locks();
     ESP_ERROR_CHECK(s_lock?ESP_OK:ESP_ERR_NO_MEM);
-    ESP_ERROR_CHECK(devices_load());
-    ESP_ERROR_CHECK(supla_config_load());
+    esp_err_t err=devices_load();
+    if(err!=ESP_OK){s_registry_readonly=true;gateway::note_boot_fault("device_registry",err);}
+    const esp_err_t supla_err=supla_config_load();
+    if(supla_err!=ESP_OK)gateway::note_boot_fault("supla_config",supla_err);
     log_capture_start();
     start_http_server();
-    supla_bridge_start();
+    if(supla_err==ESP_OK)supla_bridge_start();
 }

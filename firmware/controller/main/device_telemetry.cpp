@@ -65,6 +65,13 @@ void applied(uint64_t node,uint16_t ep,Metric metric,bool valid,int64_t raw,int 
 void subscription(uint64_t node,bool active) {
  portENTER_CRITICAL(&guard);if(auto *c=contact(node))c->active=active;portEXIT_CRITICAL(&guard);
 }
+size_t active_subscriptions() {
+ size_t n=0;
+ portENTER_CRITICAL(&guard);
+ for(const auto &c:contacts)if(c.node&&c.active&&c.reports)++n;
+ portEXIT_CRITICAL(&guard);
+ return n;
+}
 void report(uint64_t node) {
  portENTER_CRITICAL(&guard);if(auto *c=contact(node)){c->report=esp_timer_get_time();++c->reports;}portEXIT_CRITICAL(&guard);
 }
@@ -73,8 +80,10 @@ void intervals(uint64_t node,uint16_t minimum,uint16_t maximum) {
 }
 void forget(uint64_t node) {
  portENTER_CRITICAL(&guard);
- for(auto &r:readings)if(r.node==node)r={};
- for(auto &c:contacts)if(c.node==node)c={};
+ bool free_reading=false, free_contact=false;
+ for(auto &r:readings){if(r.node==node)r={};if(!r.node)free_reading=true;}
+ for(auto &c:contacts){if(c.node==node)c={};if(!c.node)free_contact=true;}
+ if(free_reading && free_contact)overflow=false;
  portEXIT_CRITICAL(&guard);
 }
 size_t copy(uint64_t node,Reading *out,size_t capacity,Contact &c,bool &truncated) {

@@ -51,6 +51,10 @@ esp_err_t supla_config_save(const char *server,
 /* Generuje nowe GUID + AuthKey (16 B kazde, esp_fill_random) i zapisuje.
  * Opcjonalne bufory wyjsciowe: 33 znaki (32 hex + NUL). */
 esp_err_t supla_config_new_identity(char *guid_hex_out, char *authkey_hex_out);
+/* Reads the SUPLA GUID stored in an already initialised NVS partition (by label),
+ * from the current "cfg_v1" blob or the pre-0.3 legacy "guid" key. Used to check
+ * that a backup really carries this gateway's identity before restoring it. */
+esp_err_t supla_config_guid_from_partition(const char *partition_label, uint8_t guid[SUPLA_CFG_ID_SIZE]);
 
 /* 16 B -> 32 znaki hex + NUL (out >= 33 B). */
 void supla_config_bytes_to_hex(const uint8_t *in, char *out);

@@ -1,4 +1,6 @@
 #include "driver/gpio.h"
+#include "driver/rmt_tx.h"
+#include "esp_rom_sys.h"
 #include "soc/usb_serial_jtag_struct.h"
 
 /*
@@ -9,9 +11,11 @@
    CONDITIONS OF ANY KIND, either express or implied.
 */
 
+#include <cJSON.h>
 #include <esp_err.h>
 #include <esp_console.h>
 #include <esp_debug_helpers.h>
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <nvs_flash.h>
 
@@ -107,8 +111,63 @@ static int startup_trace_command(int, char **)
     return esp_backtrace_print_all_tasks(16);
 }
 
+// Force onboard WS2812 RGB LED (GPIO48 on DevKitC-1 v1.1/YD-ESP32-S3, GPIO38 on v1.0)
+// to RGB(0,0,0) on boot and hold the data line LOW so power-on glitches never leave it lit.
+static void turn_off_ws2812_pin(gpio_num_t pin)
+{
+    rmt_channel_handle_t chan = nullptr;
+    rmt_tx_channel_config_t tx_cfg = {};
+    tx_cfg.gpio_num = pin;
+    tx_cfg.clk_src = RMT_CLK_SRC_DEFAULT;
+    tx_cfg.resolution_hz = 10000000; // 10 MHz -> 100 ns/tick
+    tx_cfg.mem_block_symbols = 64;
+    tx_cfg.trans_queue_depth = 1;
+    if (rmt_new_tx_channel(&tx_cfg, &chan) == ESP_OK) {
+        rmt_encoder_handle_t enc = nullptr;
+        rmt_copy_encoder_config_t enc_cfg = {};
+        if (rmt_new_copy_encoder(&enc_cfg, &enc) == ESP_OK) {
+            if (rmt_enable(chan) == ESP_OK) {
+                rmt_symbol_word_t zero_bits[24];
+                for (auto &sym : zero_bits) {
+                    sym.level0 = 1;
+                    sym.duration0 = 4; // 400 ns HIGH (WS2812 '0' bit)
+                    sym.level1 = 0;
+                    sym.duration1 = 8; // 800 ns LOW
+                }
+                rmt_transmit_config_t xfer = {};
+                xfer.loop_count = 0;
+                if (rmt_transmit(chan, enc, zero_bits, sizeof(zero_bits), &xfer) == ESP_OK) {
+                    rmt_tx_wait_all_done(chan, 50);
+                }
+                esp_rom_delay_us(100); // >50 us WS2812 latch reset
+                rmt_disable(chan);
+            }
+            rmt_del_encoder(enc);
+        }
+        rmt_del_channel(chan);
+    }
+    gpio_reset_pin(pin);
+    gpio_set_direction(pin, GPIO_MODE_OUTPUT);
+    gpio_set_level(pin, 0);
+}
+
 extern "C" void app_main()
 {
+    // Route cJSON allocations to PSRAM first (fallback to internal DRAM) so large
+    // JSON payloads at 64 devices never starve Wi-Fi/TLS of internal SRAM.
+    static cJSON_Hooks s_cjson_psram_hooks = {
+        [](size_t sz) -> void * {
+            return heap_caps_malloc_prefer(sz, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
+                                           MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        },
+        [](void *ptr) { heap_caps_free(ptr); },
+    };
+    cJSON_InitHooks(&s_cjson_psram_hooks);
+
+    // Turn off onboard WS2812 RGB LED immediately so adapter power-on never leaves it latched ON.
+    turn_off_ws2812_pin(GPIO_NUM_48);
+    turn_off_ws2812_pin(GPIO_NUM_38);
+
     // The native USB connector carries UART. Release its PHY and D+ pull-up
     // before the UART driver assigns the pins through the GPIO matrix.
     USB_SERIAL_JTAG.conf0.dp_pullup = 0;
@@ -119,7 +178,9 @@ extern "C" void app_main()
     esp_err_t err = ESP_OK;
 
     /* Initialize the ESP NVS layer */
-    ESP_ERROR_CHECK(gateway::apply_pending_restore());
+    // A failed/corrupt staged restore must never block boot: the current NVS is
+    // either untouched (bad staging copy) or retried a bounded number of times.
+    const esp_err_t restore_err = gateway::apply_pending_restore();
     ESP_ERROR_CHECK(nvs_flash_init());
 #if CONFIG_ENABLE_CHIP_SHELL
     esp_matter::console::diagnostics_register_commands();
@@ -211,6 +272,9 @@ extern "C" void app_main()
     ESP_LOGI(TAG, "Startup stage: Wi-Fi manager");
     ESP_ERROR_CHECK(wifi_manager_start());
     ESP_LOGI(TAG, "Startup stage: gateway services & HTTPS panel");
+    if (restore_err != ESP_OK) gateway::note_boot_fault("nvs_restore", restore_err);
+    // Registry mutexes must exist before gateway services (MQTT) may read the registry.
+    quick_add_init_locks();
     gateway::start();
     quick_add_start();
     ESP_LOGI(TAG, "Startup stage: ready");

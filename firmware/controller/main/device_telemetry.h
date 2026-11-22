@@ -13,6 +13,7 @@ struct Contact {uint64_t node=0;bool active=false;int64_t report=0;uint16_t mini
 void observe(uint64_t,uint16_t,Metric,bool,int64_t,Source);
 void applied(uint64_t,uint16_t,Metric,bool,int64_t,int);
 void subscription(uint64_t,bool);
+size_t active_subscriptions();
 void report(uint64_t);
 void intervals(uint64_t,uint16_t,uint16_t);
 void forget(uint64_t);

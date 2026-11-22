@@ -8,10 +8,17 @@
 #include <nvs.h>
 #include <psa/crypto.h>
 #include <mbedtls/base64.h>
+#include <esp_attr.h>
+#include <esp_log.h>
 #include <memory>
 #include <cstring>
 namespace gateway {namespace {
-constexpr uint32_t pending=0xfffffffe,done=0xfffffffc;
+// Flash writes only clear bits: pending -> done / failed are both reachable.
+constexpr uint32_t pending=0xfffffffe,done=0xfffffffc,failed=0xfffffff8;
+constexpr uint32_t kAttemptMagic=0x4d32524eu,kMaxAttempts=3;
+constexpr const char *kTag="gateway_restore";
+// Survives panic/software resets (not power loss): bounds restore retries.
+RTC_NOINIT_ATTR uint32_t s_attempt_magic,s_attempts;
 struct Stage {BackupHeader header;uint32_t state;};
 struct Lease {bool owned;Lease():owned(!mutation_busy()){}~Lease(){if(owned)mutation_done();}};
 const esp_partition_t *nvs_part(){return esp_partition_find_first(ESP_PARTITION_TYPE_DATA,ESP_PARTITION_SUBTYPE_DATA_NVS,"nvs");}
@@ -43,23 +50,37 @@ auto h=*(BackupHeader*)image.get();uint8_t sha[32];if(!digest(image.get()+sizeof
  if(esp_partition_erase_range(stage,0,stage->size)!=ESP_OK||esp_partition_write(stage,4096,image.get()+sizeof(h),h.bytes)!=ESP_OK){return reply(req,500,"Nie zapisano kopii roboczej. Biezace NVS bez zmian.");}
 
  esp_partition_t check=*stage;check.address+=4096;check.size=h.bytes;check.type=ESP_PARTITION_TYPE_DATA;check.subtype=ESP_PARTITION_SUBTYPE_DATA_NVS;strncpy(check.label,"restorecheck",sizeof(check.label));
- esp_err_t init=nvs_flash_init_partition_ptr(&check);nvs_handle_t handle;bool identity=false;if(init==ESP_OK){if(nvs_open_from_partition(check.label,"supla",NVS_READONLY,&handle)==ESP_OK){uint8_t guid[16];size_t len=16;identity=nvs_get_blob(handle,"guid",guid,&len)==ESP_OK&&len==16&&!memcmp(guid,h.guid,16);nvs_close(handle);}nvs_flash_deinit_partition(check.label);}
+ // The SUPLA identity lives in "cfg_v1" (legacy key "guid" before 0.3); both are accepted.
+ esp_err_t init=nvs_flash_init_partition_ptr(&check);bool identity=false;if(init==ESP_OK){uint8_t guid[16];identity=supla_config_guid_from_partition(check.label,guid)==ESP_OK&&!memcmp(guid,h.guid,16);memset(guid,0,sizeof(guid));nvs_flash_deinit_partition(check.label);}
  if(!identity){return reply(req,409,"Niepoprawny magazyn NVS lub tozsamosc. Odtwarzanie anulowane.");}
 
  if(esp_partition_read(stage,4096,image.get(),h.bytes)!=ESP_OK){return reply(req,500,"Blad weryfikacji kopii roboczej.");}
-if(!digest(image.get(),h.bytes,h.sha)){return reply(req,500,"Blad SHA256 kopii roboczej. NVS bez zmian.");}memset(image.get(),0,capacity);Stage record{h,pending};if(esp_partition_write(stage,0,&record,sizeof(record))!=ESP_OK){return reply(req,500,"Nie zatwierdzono odtwarzania.");}
+// Compare the read-back staging copy with the backup's own hash (never overwrite h.sha).
+uint8_t staged[32];if(!digest(image.get(),h.bytes,staged)||memcmp(staged,h.sha,32)){return reply(req,500,"Blad SHA256 kopii roboczej. NVS bez zmian.");}memset(image.get(),0,capacity);Stage record{h,pending};if(esp_partition_write(stage,0,&record,sizeof(record))!=ESP_OK){return reply(req,500,"Nie zatwierdzono odtwarzania.");}
 auto result=reply(req,200,"Kopia sprawdzona. Bramka zrestartuje sie i odtworzy NVS przed uruchomieniem Matter.");restart_later();return result;}
 esp_err_t apply_pending_restore(){const auto *p=stage_part(),*target=nvs_part();if(!p||!target){return ESP_OK;}
 Stage s{};if(esp_partition_read(p,0,&s,sizeof(s))!=ESP_OK){return ESP_FAIL;}
-if(s.state!=pending||!backup_header(s.header,sizeof(BackupHeader)+target->size)){return ESP_OK;}
+if(s.state!=pending||!backup_header(s.header,sizeof(BackupHeader)+target->size)){s_attempt_magic=0;return ESP_OK;}
+auto finish=[p](uint32_t state){s_attempt_magic=0;return esp_partition_write(p,offsetof(Stage,state),&state,sizeof(state));};
 
  auto data=std::unique_ptr<uint8_t[]>(new(std::nothrow)uint8_t[s.header.bytes]);if(!data){return ESP_ERR_NO_MEM;}
 uint8_t sha[32];if(esp_partition_read(p,4096,data.get(),s.header.bytes)!=ESP_OK){return ESP_FAIL;}
-if(!digest(data.get(),s.header.bytes,sha)){return ESP_FAIL;}if(memcmp(sha,s.header.sha,32)){return ESP_ERR_INVALID_CRC;}
+// A corrupt staging copy is abandoned before the live NVS is touched.
+if(!digest(data.get(),s.header.bytes,sha)){return ESP_FAIL;}if(memcmp(sha,s.header.sha,32)){ESP_LOGE(kTag,"Staged backup corrupt; restore abandoned, NVS unchanged");finish(failed);return ESP_ERR_INVALID_CRC;}
 
- // Pending stays intact across power loss. Repeat until the complete NVS is verified.
- esp_err_t e=esp_partition_erase_range(target,0,target->size);if(e==ESP_OK)e=esp_partition_write(target,0,data.get(),s.header.bytes);if(e!=ESP_OK){return e;}
-if(esp_partition_read(target,0,data.get(),s.header.bytes)!=ESP_OK){return ESP_FAIL;}
-if(!digest(data.get(),s.header.bytes,sha)){return ESP_FAIL;}memset(data.get(),0,s.header.bytes);if(memcmp(sha,s.header.sha,32)){return ESP_ERR_INVALID_CRC;}
-uint32_t state=done;return esp_partition_write(p,offsetof(Stage,state),&state,sizeof(state));}
+ // Pending stays intact across power loss and is retried; panic/reset loops are
+ // bounded to kMaxAttempts, after which NVS is left blank (boots to setup AP) so
+ // the gateway never loops on a half-written NVS. The backup file still exists.
+ if(s_attempt_magic!=kAttemptMagic){s_attempt_magic=kAttemptMagic;s_attempts=0;}
+ for(;;){
+  if(++s_attempts>kMaxAttempts){ESP_LOGE(kTag,"Restore failed %u times; clearing NVS and giving up",(unsigned)kMaxAttempts);esp_partition_erase_range(target,0,target->size);memset(data.get(),0,s.header.bytes);finish(failed);return ESP_ERR_INVALID_STATE;}
+  esp_err_t e=esp_partition_read(p,4096,data.get(),s.header.bytes);
+  if(e==ESP_OK)e=esp_partition_erase_range(target,0,target->size);
+  if(e==ESP_OK)e=esp_partition_write(target,0,data.get(),s.header.bytes);
+  if(e==ESP_OK)e=esp_partition_read(target,0,data.get(),s.header.bytes);
+  const bool verified=e==ESP_OK&&digest(data.get(),s.header.bytes,sha)&&!memcmp(sha,s.header.sha,32);
+  memset(data.get(),0,s.header.bytes);
+  if(verified){ESP_LOGI(kTag,"NVS restored from verified backup");return finish(done);}
+  ESP_LOGW(kTag,"Restore attempt %u failed (%s)",(unsigned)s_attempts,esp_err_to_name(e));
+ }}
 }

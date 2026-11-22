@@ -7,7 +7,10 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <memory>
+#include <new>
 
+#include <esp_attr.h>
 #include <esp_log.h>
 #include <esp_random.h>
 #include <nvs.h>
@@ -77,7 +80,7 @@ bool supla_config_hex_to_bytes(const char *hex, uint8_t *out)
 
 
 namespace {
-StaticSemaphore_t cfg_mutex_storage;
+DRAM_ATTR StaticSemaphore_t cfg_mutex_storage;
 SemaphoreHandle_t cfg_mutex=nullptr;
 struct StoredConfig { uint32_t version;
 supla_cfg_t cfg; };
@@ -144,6 +147,27 @@ esp_err_t supla_config_load(void) {
     if(err!=ESP_OK)return err;
     candidate.configured=candidate.server[0]&&candidate.email[0];
     return persist(candidate);
+}
+esp_err_t supla_config_guid_from_partition(const char *partition_label,uint8_t guid[SUPLA_CFG_ID_SIZE]) {
+    if(!partition_label||!guid)return ESP_ERR_INVALID_ARG;
+    nvs_handle_t handle;
+    esp_err_t err=nvs_open_from_partition(partition_label,SUPLA_NVS_NS,NVS_READONLY,&handle);
+    if(err!=ESP_OK)return err;
+    auto stored=std::unique_ptr<StoredConfig>(new(std::nothrow)StoredConfig{});
+    if(!stored){nvs_close(handle);return ESP_ERR_NO_MEM;}
+    size_t n=sizeof(*stored);
+    err=nvs_get_blob(handle,"cfg_v1",stored.get(),&n);
+    if(err==ESP_OK){
+        if(n!=sizeof(*stored)||stored->version!=1)err=ESP_ERR_INVALID_STATE;
+        else memcpy(guid,stored->cfg.guid,SUPLA_CFG_ID_SIZE);
+    } else if(err==ESP_ERR_NVS_NOT_FOUND){
+        n=SUPLA_CFG_ID_SIZE;
+        err=nvs_get_blob(handle,"guid",guid,&n);
+        if(err==ESP_OK&&n!=SUPLA_CFG_ID_SIZE)err=ESP_ERR_INVALID_SIZE;
+    }
+    memset(stored.get(),0,sizeof(*stored)); // holds the AuthKey as well
+    nvs_close(handle);
+    return err;
 }
 esp_err_t supla_config_copy(supla_cfg_t *out) {
     if(!out)return ESP_ERR_INVALID_ARG;
