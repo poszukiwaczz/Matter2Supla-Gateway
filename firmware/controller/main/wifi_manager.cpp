@@ -51,6 +51,7 @@ static std::atomic<int> s_fail_count{0};
 static char s_ap_ssid[33] = "";
 static char s_sta_ssid[33] = "";
 static char s_sta_pass[65] = "";
+static wifi_auth_mode_t s_sta_authmode = WIFI_AUTH_OPEN;
 static std::atomic<bool> s_ap_timeout_pending{false};
 static std::atomic<bool> s_got_ip_pending{false};
 static std::atomic<uint32_t> s_disconnects{0}, s_ip_losses{0}, s_last_disconnect_reason{0};
@@ -155,11 +156,19 @@ static bool load_creds(char *ssid,size_t ssid_size,char *pass,size_t pass_size) 
     err=nvs_get_blob(h,"creds_v1",&record,&n);
     if(err==ESP_OK) {
         bool valid=n==sizeof(record)&&record.version==1&&memchr(record.ssid,0,sizeof(record.ssid))&&memchr(record.pass,0,sizeof(record.pass))&&m2s::valid_wifi(record.ssid,record.pass);
+        uint8_t stored_auth=0;
+        const bool has_auth=(nvs_get_u8(h,"authmode",&stored_auth)==ESP_OK);
         nvs_close(h);
         if(!valid){s_last_error=ESP_ERR_INVALID_STATE;
         return false;}
         snprintf(ssid,ssid_size,"%s",record.ssid);
         snprintf(pass,pass_size,"%s",record.pass);
+        if(pass[0]){
+            s_sta_authmode=(has_auth && stored_auth>=WIFI_AUTH_WPA_PSK && stored_auth<=WIFI_AUTH_WPA2_PSK)
+                ? static_cast<wifi_auth_mode_t>(stored_auth) : WIFI_AUTH_WPA_PSK;
+        } else {
+            s_sta_authmode=WIFI_AUTH_OPEN;
+        }
         return true;
     }
     if(err!=ESP_ERR_NVS_NOT_FOUND){nvs_close(h);
@@ -174,19 +183,25 @@ static bool load_creds(char *ssid,size_t ssid_size,char *pass,size_t pass_size) 
     if(err==ESP_ERR_NVS_NOT_FOUND)return false;
     if(err!=ESP_OK||(pe!=ESP_OK&&pe!=ESP_ERR_NVS_NOT_FOUND)||!m2s::valid_wifi(ssid,pass)){s_last_error=ESP_ERR_INVALID_STATE;
     return false;}
+    s_sta_authmode=pass[0]?WIFI_AUTH_WPA_PSK:WIFI_AUTH_OPEN;
     return true;
 }
-static esp_err_t save_creds(const char *ssid,const char *pass) {
+static esp_err_t save_creds(const char *ssid,const char *pass,wifi_auth_mode_t authmode) {
     WifiCredentials record{};
     record.version=1;
     snprintf(record.ssid,sizeof(record.ssid),"%s",ssid);
     snprintf(record.pass,sizeof(record.pass),"%s",pass);
+    const wifi_auth_mode_t stored_auth = pass[0]
+        ? (authmode>=WIFI_AUTH_WPA2_PSK ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_WPA_PSK)
+        : WIFI_AUTH_OPEN;
     nvs_handle_t h;
     esp_err_t err=nvs_open(WIFI_NVS_NS,NVS_READWRITE,&h);
     if(err!=ESP_OK)return err;
     err=nvs_set_blob(h,"creds_v1",&record,sizeof(record));
+    if(err==ESP_OK)err=nvs_set_u8(h,"authmode",static_cast<uint8_t>(stored_auth));
     if(err==ESP_OK)err=nvs_commit(h);
     nvs_close(h);
+    if(err==ESP_OK)s_sta_authmode=stored_auth;
     return err;
 }
 esp_err_t wifi_manager_forget(void) {
@@ -199,7 +214,8 @@ esp_err_t wifi_manager_forget(void) {
     if(err==ESP_OK)err=nvs_commit(h);
     nvs_close(h);
     if(err==ESP_OK){s_sta_ssid[0]=0;
-    s_sta_pass[0]=0;}
+    s_sta_pass[0]=0;
+    s_sta_authmode=WIFI_AUTH_OPEN;}
     s_last_error=err;
     return err;
 }
@@ -222,11 +238,15 @@ static esp_err_t start_sta_locked(bool keep_ap)
 {
     keep_ap=keep_ap && s_ap_started.load();
     wifi_config_t sta_cfg = {};
+    wifi_auth_mode_t min_auth = WIFI_AUTH_OPEN;
     { WifiLock lock;
       memcpy(sta_cfg.sta.ssid,s_sta_ssid,strlen(s_sta_ssid));
       memcpy(sta_cfg.sta.password,s_sta_pass,strlen(s_sta_pass));
+      min_auth = s_sta_authmode;
     }
-    sta_cfg.sta.threshold.authmode = sta_cfg.sta.password[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+    sta_cfg.sta.threshold.authmode = sta_cfg.sta.password[0]
+        ? (min_auth >= WIFI_AUTH_WPA_PSK ? min_auth : WIFI_AUTH_WPA_PSK)
+        : WIFI_AUTH_OPEN;
 
     s_got_ip_pending=false;
     ++s_link_generation;
@@ -286,6 +306,7 @@ esp_err_t wifi_manager_connect(const char *ssid,const char *pass) {
     {WifiLock lock;
     snprintf(s_sta_ssid,sizeof(s_sta_ssid),"%s",ssid);
     snprintf(s_sta_pass,sizeof(s_sta_pass),"%s",pass?pass:"");
+    s_sta_authmode=s_sta_pass[0]?WIFI_AUTH_WPA_PSK:WIFI_AUTH_OPEN;
     s_pending=false;}
     esp_err_t err=start_sta_locked(s_ap_started.load());
     s_last_error=err;
@@ -326,7 +347,7 @@ static void finish_got_ip_locked(const wifi_ap_record_t &ap)
     {
         WifiLock lock;
         if(s_pending && strcmp(reinterpret_cast<const char *>(ap.ssid),s_sta_ssid)==0){
-            s_last_error=save_creds(s_sta_ssid,s_sta_pass);
+            s_last_error=save_creds(s_sta_ssid,s_sta_pass,ap.authmode);
             s_pending=false;
             if(s_last_error!=ESP_OK)ESP_LOGE(TAG,"Wi-Fi połączone, zapis NVS nie powiódł się");
         }
