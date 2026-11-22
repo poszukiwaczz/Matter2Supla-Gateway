@@ -69,11 +69,14 @@ uint8_t sha[32];if(esp_partition_read(p,4096,data.get(),s.header.bytes)!=ESP_OK)
 if(!digest(data.get(),s.header.bytes,sha)){return ESP_FAIL;}if(memcmp(sha,s.header.sha,32)){ESP_LOGE(kTag,"Staged backup corrupt; restore abandoned, NVS unchanged");finish(failed);return ESP_ERR_INVALID_CRC;}
 
  // Pending stays intact across power loss and is retried; panic/reset loops are
- // bounded to kMaxAttempts, after which NVS is left blank (boots to setup AP) so
- // the gateway never loops on a half-written NVS. The backup file still exists.
+ // bounded to kMaxAttempts, after which partial NVS is cleared once (boots to
+ // setup AP) while keeping the verified staging copy as pending so a full power
+ // cycle gets fresh retries. Subsequent warm reboots skip immediately without
+ // re-erasing NVS (preserving Wi-Fi configured in AP mode).
  if(s_attempt_magic!=kAttemptMagic){s_attempt_magic=kAttemptMagic;s_attempts=0;}
+ if(s_attempts>=kMaxAttempts){ESP_LOGW(kTag,"Restore deferred until power cycle (%u failed attempts); NVS untouched",(unsigned)s_attempts);memset(data.get(),0,s.header.bytes);return ESP_ERR_INVALID_STATE;}
  for(;;){
-  if(++s_attempts>kMaxAttempts){ESP_LOGE(kTag,"Restore failed %u times; clearing NVS and giving up",(unsigned)kMaxAttempts);esp_partition_erase_range(target,0,target->size);memset(data.get(),0,s.header.bytes);finish(failed);return ESP_ERR_INVALID_STATE;}
+  if(++s_attempts>kMaxAttempts){ESP_LOGE(kTag,"Restore failed %u times; clearing partial NVS and keeping verified staging copy pending",(unsigned)kMaxAttempts);esp_partition_erase_range(target,0,target->size);memset(data.get(),0,s.header.bytes);return ESP_ERR_INVALID_STATE;}
   esp_err_t e=esp_partition_read(p,4096,data.get(),s.header.bytes);
   if(e==ESP_OK)e=esp_partition_erase_range(target,0,target->size);
   if(e==ESP_OK)e=esp_partition_write(target,0,data.get(),s.header.bytes);
@@ -83,4 +86,11 @@ if(!digest(data.get(),s.header.bytes,sha)){return ESP_FAIL;}if(memcmp(sha,s.head
   if(verified){ESP_LOGI(kTag,"NVS restored from verified backup");return finish(done);}
   ESP_LOGW(kTag,"Restore attempt %u failed (%s)",(unsigned)s_attempts,esp_err_to_name(e));
  }}
+const char *restore_state(){const auto *p=stage_part(),*target=nvs_part();if(!p||!target)return "none";
+ Stage s{};if(esp_partition_read(p,0,&s,sizeof(s))!=ESP_OK)return "none";
+ if(!backup_header(s.header,sizeof(BackupHeader)+target->size))return "none";
+ if(s.state==pending)return "pending";
+ if(s.state==done)return "done";
+ if(s.state==failed)return "failed";
+ return "none";}
 }

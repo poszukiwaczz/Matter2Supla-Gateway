@@ -5,6 +5,7 @@
 namespace gateway {
 void start();
 esp_err_t apply_pending_restore();
+const char *restore_state();
 esp_err_t diagnostics(httpd_req_t*);
 esp_err_t settings_get(httpd_req_t*);
 esp_err_t name_save(httpd_req_t*);
