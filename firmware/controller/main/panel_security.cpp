@@ -306,9 +306,8 @@ bool panel_security_authorize(httpd_req_t *req,bool mutation,bool plain_body) {
                         if(password_digest_pbkdf2(credential,migrated.salt,migrated.iterations,migrated.digest)) {
                             nvs_handle_t nvs;
                             if(nvs_open("panel_sec",NVS_READWRITE,&nvs)==ESP_OK) {
+                                // access_v1 is kept for rollback to factory beta4 / 0.3.x — never erase.
                                 if(nvs_set_blob(nvs,"access_v2",&migrated,sizeof(migrated))==ESP_OK && nvs_commit(nvs)==ESP_OK) {
-                                    nvs_erase_key(nvs,"access_v1");
-                                    nvs_commit(nvs);
                                     access_record_v2=migrated;
                                     password_v2=true;
                                 }
@@ -381,14 +380,19 @@ esp_err_t panel_security_change_password(const char *password) {
     next.iterations=kPbkdf2Iterations;
     esp_fill_random(next.salt,sizeof(next.salt));
     if(!password_digest_pbkdf2(password,next.salt,next.iterations,next.digest))return ESP_FAIL;
+    // access_v1 is kept for rollback to factory beta4 / 0.3.x — never erase.
+    AccessRecord next_v1{};
+    next_v1.version=1;
+    esp_fill_random(next_v1.salt,sizeof(next_v1.salt));
+    if(!password_digest_v1(password,next_v1,next_v1.digest))return ESP_FAIL;
     nvs_handle_t nvs;
     esp_err_t err=nvs_open("panel_sec",NVS_READWRITE,&nvs);
     if(err!=ESP_OK)return err;
     err=nvs_set_blob(nvs,"access_v2",&next,sizeof(next));
+    if(err==ESP_OK)err=nvs_set_blob(nvs,"access_v1",&next_v1,sizeof(next_v1));
     if(err==ESP_OK)err=nvs_commit(nvs);
-    if(err==ESP_OK){nvs_erase_key(nvs,"access_v1");nvs_commit(nvs);}
     nvs_close(nvs);
-    if(err==ESP_OK){access_record_v2=next;password_configured=true;password_v2=true;}
+    if(err==ESP_OK){access_record_v2=next;access_record=next_v1;password_configured=true;password_v2=true;}
     return err;
 }
 
