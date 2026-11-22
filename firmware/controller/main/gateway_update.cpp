@@ -56,11 +56,12 @@ void ota_health(bool core_ok,bool service_ok,bool c6_ready){
  if(esp_ota_get_state_partition(p,&state)!=ESP_OK||state!=ESP_OTA_IMG_PENDING_VERIFY){completed=true;return;}
  const int64_t up=esp_timer_get_time();
  // 90 s:  everything works -> confirm.
- // 180 s: S3 core healthy and serving (SUPLA connected or Matter active or blank),
- //        even if the C6 radio is detached (must not roll back a working S3).
+ // 180 s: core healthy and serving, or the C6 does not answer at all
+ //        (a detached radio must not roll back a good S3 image).
  // 600 s: not confirmed -> automatic rollback. The window tolerates a router
  //        reboot or a slow SUPLA registration right after the update.
- const bool confirm=(up>90000000&&service_ok&&c6_ready)||(up>180000000&&core_ok&&service_ok);
+ const bool confirm=(up>90000000&&service_ok&&c6_ready)
+                   ||(up>180000000&&core_ok&&(service_ok||!c6_ready));
  if(confirm){
   if(esp_ota_mark_app_valid_cancel_rollback()==ESP_OK){
    ESP_LOGI(kTag,"OTA image confirmed VALID at %llds (core=%d service=%d c6=%d)",(long long)(up/1000000),(int)core_ok,(int)service_ok,(int)c6_ready);
