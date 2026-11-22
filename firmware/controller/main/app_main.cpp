@@ -12,11 +12,15 @@
 */
 
 #include <cJSON.h>
+#include <esp_attr.h>
 #include <esp_err.h>
 #include <esp_console.h>
 #include <esp_debug_helpers.h>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <esp_ota_ops.h>
+#include <esp_partition.h>
+#include <esp_system.h>
 #include <nvs_flash.h>
 
 #include <esp_matter.h>
@@ -181,7 +185,32 @@ extern "C" void app_main()
     // A failed/corrupt staged restore must never block boot: the current NVS is
     // either untouched (bad staging copy) or retried a bounded number of times.
     const esp_err_t restore_err = gateway::apply_pending_restore();
-    ESP_ERROR_CHECK(nvs_flash_init());
+    static RTC_NOINIT_ATTR uint32_t s_nvs_fallback_magic;
+    constexpr uint32_t kNvsFallbackMagic = 0x4D324E56u; // "M2NV"
+    const esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_OK) {
+        s_nvs_fallback_magic = 0;
+    } else if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        // Never erase NVS automatically (contains Matter fabric & SUPLA identity).
+        // Try a one-shot fallback to another VALID app slot (or factory) before aborting.
+        gateway::note_boot_fault("nvs_init", nvs_err);
+        if (s_nvs_fallback_magic != kNvsFallbackMagic) {
+            const auto *running = esp_ota_get_running_partition();
+            const auto *target = esp_ota_get_next_update_partition(running);
+            esp_ota_img_states_t state = ESP_OTA_IMG_INVALID;
+            if (!target || esp_ota_get_state_partition(target, &state) != ESP_OK || state != ESP_OTA_IMG_VALID) {
+                target = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, "factory");
+            }
+            if (target && target != running && esp_ota_set_boot_partition(target) == ESP_OK) {
+                s_nvs_fallback_magic = kNvsFallbackMagic;
+                ESP_LOGE(TAG, "NVS init failed (%s); switching once to %s", esp_err_to_name(nvs_err), target->label);
+                esp_restart();
+            }
+        }
+        ESP_ERROR_CHECK(nvs_err);
+    } else {
+        ESP_ERROR_CHECK(nvs_err);
+    }
 #if CONFIG_ENABLE_CHIP_SHELL
     esp_matter::console::diagnostics_register_commands();
     esp_matter::console::wifi_register_commands();
@@ -270,7 +299,8 @@ extern "C" void app_main()
 
     // --- lab: trwale Wi-Fi (NVS + tryb konfiguracji AP) i mini-panel WWW ---
     ESP_LOGI(TAG, "Startup stage: Wi-Fi manager");
-    ESP_ERROR_CHECK(wifi_manager_start());
+    const esp_err_t wifi_err = wifi_manager_start();
+    if (wifi_err != ESP_OK) gateway::note_boot_fault("wifi", wifi_err);
     ESP_LOGI(TAG, "Startup stage: gateway services & HTTPS panel");
     if (restore_err != ESP_OK) gateway::note_boot_fault("nvs_restore", restore_err);
     // Registry mutexes must exist before gateway services (MQTT) may read the registry.
