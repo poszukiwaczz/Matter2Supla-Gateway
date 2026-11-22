@@ -3,9 +3,11 @@
 #include <cstring>
 #include <cctype>
 #include <initializer_list>
+#include <esp_attr.h>
 #include <esp_random.h>
 #include <esp_timer.h>
 #include <esp_netif.h>
+#include <lwip/sockets.h>
 #include <nvs.h>
 #include <mbedtls/pk.h>
 #include <psa/crypto.h>
@@ -254,9 +256,18 @@ bool panel_security_authorize(httpd_req_t *req,bool mutation,bool plain_body) {
     if(!header(req,"Authorization",authorization,sizeof(authorization)) ||
        strncmp(authorization,"Bearer ",7)!=0)
         return deny(req,"401 Unauthorized","{\"ok\":false,\"message\":\"Wymagane haslo lub token panelu.\"}");
-    static uint32_t s_failed_attempts = 0;
-    static uint32_t s_lockout_level = 0;
-    static int64_t s_lockout_until_us = 0;
+    struct IpLockout {
+        bool in_use = false;
+        uint8_t addr[16]{};
+        uint32_t failed = 0;
+        uint32_t level = 0;
+        int64_t until_us = 0;
+        int64_t last_fail_us = 0;
+        int64_t last_seen_us = 0;
+    };
+    static DRAM_ATTR IpLockout s_ip_lockouts[8]{};
+    static int64_t s_global_window_us = 0;
+    static uint32_t s_global_failed = 0;
     static bool s_boot_key_ready = false;
     static unsigned char s_boot_key[16]{};
     static bool s_verified_cache_valid = false;
@@ -264,16 +275,66 @@ bool panel_security_authorize(httpd_req_t *req,bool mutation,bool plain_body) {
     static uint32_t s_verified_cache_gen = 0;
     static uint32_t s_password_gen = 1;
     const int64_t now_us = esp_timer_get_time();
-    if (s_lockout_until_us > now_us) {
-        memset(authorization, 0, sizeof(authorization));
-        return deny(req, "429 Too Many Requests", "{\"ok\":false,\"message\":\"Zbyt wiele blednych prob logowania. Odczekaj przed kolejna proba.\"}");
-    }
+
+    auto extract_peer_ip = [](httpd_req_t *r, uint8_t out[16]) {
+        memset(out, 0, 16);
+        int fd = httpd_req_to_sockfd(r);
+        sockaddr_storage ss{};
+        socklen_t len = sizeof(ss);
+        if (fd >= 0 && getpeername(fd, reinterpret_cast<sockaddr *>(&ss), &len) == 0) {
+            if (ss.ss_family == AF_INET) {
+                const auto *in4 = reinterpret_cast<const sockaddr_in *>(&ss);
+                out[10] = 0xff;
+                out[11] = 0xff;
+                memcpy(out + 12, &in4->sin_addr, 4);
+            } else if (ss.ss_family == AF_INET6) {
+                const auto *in6 = reinterpret_cast<const sockaddr_in6 *>(&ss);
+                memcpy(out, &in6->sin6_addr, 16);
+            }
+        }
+    };
+    auto find_peer_slot = [&](const uint8_t key[16], bool create) -> IpLockout * {
+        IpLockout *free_slot = nullptr;
+        IpLockout *oldest = &s_ip_lockouts[0];
+        for (auto &slot : s_ip_lockouts) {
+            if (slot.in_use && memcmp(slot.addr, key, 16) == 0) {
+                slot.last_seen_us = now_us;
+                return &slot;
+            }
+            if (!slot.in_use && !free_slot) free_slot = &slot;
+            if (slot.last_seen_us < oldest->last_seen_us) oldest = &slot;
+        }
+        if (!create) return nullptr;
+        IpLockout *dst = free_slot ? free_slot : oldest;
+        *dst = {};
+        dst->in_use = true;
+        memcpy(dst->addr, key, 16);
+        dst->last_seen_us = now_us;
+        return dst;
+    };
+
     const char *credential=authorization+7;
-    bool accepted=false;
+    // Console recovery token is checked BEFORE any lockout and never touches IP counters.
+    bool via_token = false;
     if(strlen(credential)==64) {
         unsigned char diff=0;
         for(size_t i=0;i<64;i++)diff|=(unsigned char)(credential[i]^record.token[i]);
-        accepted=diff==0;
+        via_token = (diff==0);
+    }
+    bool accepted = via_token;
+    uint8_t peer_key[16]{};
+    IpLockout *peer = nullptr;
+    if (!via_token) {
+        extract_peer_ip(req, peer_key);
+        peer = find_peer_slot(peer_key, false);
+        if (peer && peer->last_fail_us && (now_us - peer->last_fail_us) >= 15LL * 60 * 1000000) {
+            peer->level = 0;
+            peer->failed = 0;
+        }
+        if (peer && peer->until_us > now_us) {
+            memset(authorization, 0, sizeof(authorization));
+            return deny(req, "429 Too Many Requests", "{\"ok\":false,\"message\":\"Zbyt wiele blednych prob logowania z tego adresu. Odczekaj przed kolejna proba.\"}");
+        }
     }
     if(!accepted && password_configured) {
         if(!s_boot_key_ready){esp_fill_random(s_boot_key,sizeof(s_boot_key));s_boot_key_ready=true;}
@@ -334,17 +395,36 @@ bool panel_security_authorize(httpd_req_t *req,bool mutation,bool plain_body) {
     }
     memset(authorization,0,sizeof(authorization));
     if(!accepted) {
-        if (++s_failed_attempts >= 5) {
-            static constexpr int64_t kLockoutUs[] = {5000000LL, 15000000LL, 45000000LL, 120000000LL, 300000000LL};
-            const size_t idx = s_lockout_level < 5 ? s_lockout_level : 4;
-            s_lockout_until_us = now_us + kLockoutUs[idx];
-            if (s_lockout_level < 4) ++s_lockout_level;
-            s_failed_attempts = 0;
+        if (!peer) peer = find_peer_slot(peer_key, true);
+        if (peer) {
+            if (peer->last_fail_us && (now_us - peer->last_fail_us) >= 15LL * 60 * 1000000) {
+                peer->level = 0;
+                peer->failed = 0;
+            }
+            peer->last_fail_us = now_us;
+            if (++peer->failed >= 5) {
+                static constexpr int64_t kLockoutUs[] = {5000000LL, 15000000LL, 45000000LL, 120000000LL, 300000000LL};
+                const size_t idx = peer->level < 5 ? peer->level : 4;
+                peer->until_us = now_us + kLockoutUs[idx];
+                if (peer->level < 4) ++peer->level;
+                peer->failed = 0;
+            }
+        }
+        if (!s_global_window_us || (now_us - s_global_window_us) >= 60000000LL) {
+            s_global_window_us = now_us;
+            s_global_failed = 0;
+        }
+        if (++s_global_failed >= 30) {
+            return deny(req, "429 Too Many Requests", "{\"ok\":false,\"message\":\"Zbyt wiele blednych prob logowania w sieci. Odczekaj chwile lub uzyj tokenu z konsoli.\"}");
         }
         return deny(req,"401 Unauthorized","{\"ok\":false,\"message\":\"Nieprawidlowe haslo lub token panelu.\"}");
     }
-    s_failed_attempts = 0;
-    s_lockout_level = 0;
+    if (!via_token && peer) {
+        peer->failed = 0;
+        peer->level = 0;
+        peer->until_us = 0;
+        peer->last_fail_us = 0;
+    }
     if(strcmp(req->uri,"/api/panel/password")==0)++s_password_gen;
     if (mutation) {
         char type[80];
