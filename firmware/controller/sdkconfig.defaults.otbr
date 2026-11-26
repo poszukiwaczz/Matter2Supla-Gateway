@@ -1,0 +1,54 @@
+# OpenThread Border Router (OTBR) delta for the controller example.
+# Layer it on top of the base config:
+#   idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.otbr" ...
+
+# Enable OpenThread Border Router
+CONFIG_OPENTHREAD_ENABLED=y
+CONFIG_OPENTHREAD_LOG_LEVEL_DYNAMIC=n
+CONFIG_OPENTHREAD_LOG_LEVEL_NOTE=y
+CONFIG_OPENTHREAD_BORDER_ROUTER=y
+CONFIG_OPENTHREAD_SRP_CLIENT=n
+CONFIG_OPENTHREAD_DNS_CLIENT=n
+CONFIG_THREAD_TASK_STACK_SIZE=8192
+CONFIG_THREAD_NETWORK_COMMISSIONING_DRIVER=n
+
+# LwIP config for OpenThread (overrides the base IPv6 address count)
+CONFIG_LWIP_IPV6_NUM_ADDRESSES=12
+CONFIG_LWIP_MULTICAST_PING=y
+CONFIG_LWIP_IPV6_FORWARD=y
+CONFIG_LWIP_NETIF_STATUS_CALLBACK=y
+
+# Border-router partition table
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_br.csv"
+
+# mbedTLS extras needed by the Thread commissioner
+CONFIG_MBEDTLS_KEY_EXCHANGE_ECJPAKE=y
+CONFIG_MBEDTLS_ECJPAKE_C=y
+CONFIG_MBEDTLS_SSL_PROTO_DTLS=y
+
+# mDNS platform
+CONFIG_USE_MINIMAL_MDNS=n
+CONFIG_ENABLE_EXTENDED_DISCOVERY=y
+CONFIG_MDNS_MULTIPLE_INSTANCE=y
+
+# Wi-Fi station only (Wi-Fi <-> Thread border routing)
+CONFIG_ENABLE_WIFI_STATION=y
+CONFIG_ENABLE_WIFI_AP=n
+
+CONFIG_ESP_MATTER_CONTROLLER_CUSTOM_CLUSTER_ENABLE=n
+CONFIG_BUILD_CHIP_TESTS=n
+CONFIG_ENABLE_OTA_REQUESTOR=n
+
+# OTBR already installs the route hook, so Matter must not install its own
+CONFIG_ENABLE_ROUTE_HOOK=n
+
+# v2 uses native USB pins for UART transport; console stays on UART0
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# The border-router reference board uses quad PSRAM (base defaults to octal)
+CONFIG_SPIRAM_MODE_QUAD=y
+
+# Main task stack for the OTBR build (base controller uses 10240)
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+

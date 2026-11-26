@@ -1,0 +1,33 @@
+# Private / local installation data & local AI working notes ??? NEVER commit
+AI_MEMORY.md
+00_START_HERE.md
+TODO.md
+CHANGELOG.md
+docs/HISTORIA-0.3.3-0.4.0.md
+backups/
+logs/
+private/
+*private*
+*.key
+update-signing-key.pem
+settings-encrypted.json
+before-*.bin
+after-*.bin
+hardware-*-verification.json
+
+# Build outputs & binary release bundles (attached to GitHub Releases instead)
+build-artifacts/
+do-wgrania/
+**/build/
+**/.gradle/
+**/.kotlin/
+android-app/local.properties
+android-app/*.apk
+__pycache__/
+*.pyc
+
+
+scripts/Install-S3-*-Serial.py
+scripts/Inspect-LiveLogs.py
+scripts/Verify-Live*.py
+scripts/Upload-Ota*.py

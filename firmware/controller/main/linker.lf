@@ -1,0 +1,17 @@
+# BSS relocation for the Matter SDK libraries (libCHIP.a / libesp_matter.a) is
+# handled automatically by the esp_matter component when
+# CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY is enabled. This fragment only
+# covers the application- and Thread-specific archives.
+#
+
+[mapping:main]
+archive: libmain.a
+entries:
+    if ESP_ALLOW_BSS_SEG_EXTERNAL_MEMORY = y:
+        * (extram_bss)
+
+[mapping:openthread_bss]
+archive: libopenthread.a
+entries:
+    if ESP_ALLOW_BSS_SEG_EXTERNAL_MEMORY = y && OPENTHREAD_ENABLED = y:
+        * (extram_bss)

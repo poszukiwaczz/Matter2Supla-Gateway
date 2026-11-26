@@ -1,0 +1,62 @@
+# ============================================================================
+#  Tandem bramki: ESP32-S3 N16R8 (16 MB flash, PSRAM 8 MB OCT) + C6 jako RCP.
+#
+#  WAŻNE: ten plik MUSI być OSTATNIĄ warstwą sdkconfig.defaults:
+#     -SdkDefaults "sdkconfig.defaults;sdkconfig.defaults.otbr;sdkconfig.defaults.tandem"
+#
+#  Powód: nakładka otbr ustawia QUAD PSRAM (ich devkit); plik
+#  sdkconfig.defaults.<target> jest czytany PRZED listą SDKCONFIG_DEFAULTS,
+#  więc nie nadaje się na nadpisywanie warstw — ta warstwa jest ostatnia.
+# ============================================================================
+
+# 16 MB flash
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# PSRAM: nasz moduł ma 8 MB OCT (R8), nie QUAD
+CONFIG_SPIRAM_MODE_OCT=y
+
+# Radio: C6 jako RCP po UART (piny/baud hosta: main/esp_ot_config.h — UART1 RX20/TX19 @2000000 przez gniazdo USB)
+CONFIG_OPENTHREAD_RADIO_SPINEL_UART=y
+
+# Bez auto-aktualizacji RCP (domyślny config celuje w H2; ot_rcp wgramy po USB)
+CONFIG_AUTO_UPDATE_RCP=n
+
+# Supla: build z logami (SUPLA_DEBUG) - potrzebne na etapie testow.
+# Uwaga: przy istniejacym sdkconfig skrypt 30_build_app.ps1 dopisuje to samo
+# bezposrednio do sdkconfig (bez regeneracji calego pliku).
+CONFIG_SUPLA_DEBUG_BUILD=y
+
+# Supla: supla-device ma wlasny lokalny web-serwer (config mode), ktory przy
+# starcie generuje certyfikat TLS - wymaga zapisu X.509 w mbedtls.
+# Te same flagi co w upstreamowym extras/examples/esp_idf/sdkconfig.defaults.
+CONFIG_MBEDTLS_PK_WRITE_C=y
+CONFIG_MBEDTLS_X509_CREATE_C=y
+CONFIG_MBEDTLS_X509_CSR_WRITE_C=y
+CONFIG_MBEDTLS_X509_CRT_WRITE_C=y
+
+# Atestacja urzadzen: PAA z DCL (on.dcl.csa-iot.org) zamiast testowego magazynu
+# certyfikatow - wymagane do parowania certyfikowanych urzadzen (IKEA).
+# Uwaga: przy istniejacym sdkconfig skrypt 30_build_app.ps1 przelacza to samo
+# bezposrednio w sdkconfig (bez regeneracji calego pliku).
+CONFIG_DCL_ATTESTATION_TRUST_STORE=y
+
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=n
+
+CONFIG_ESP_CONSOLE_USB_CDC=n
+
+CONFIG_ESP_CONSOLE_UART_CUSTOM=n
+
+CONFIG_ESP_CONSOLE_NONE=n
+
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=n
+
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG_ENABLED=n
+
+CONFIG_ESP_CONSOLE_UART_NUM=0
+
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
+

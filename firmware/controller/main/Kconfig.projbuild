@@ -1,0 +1,14 @@
+menu "Matter2Supla gateway"
+
+    config M2S_SINGLE_USB_RCP_OTA
+        bool "Single USB-C build: remote ESP32-C6 RCP OTA over UART1"
+        default n
+        help
+            Enables the /api/gateway/update-rcp endpoint and the boot-time
+            transfer of a staged, signed C6 RCP image (M2SRCP1) over UART1.
+            Requires the C6 to run the 2xOTA RCP firmware from
+            firmware/c6-rcp-ota. The firmware version gets
+            the "-singleusb" suffix and FW_BUILD_BASE + 1, so both variants
+            never share one build number.
+
+endmenu
