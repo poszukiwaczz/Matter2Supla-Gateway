@@ -66,6 +66,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 private val MatterDarkColors = darkColorScheme(
@@ -105,6 +106,7 @@ fun Matter2SuplaApp(storage: GatewayStorage) {
 
     var selectedGateway by remember { mutableStateOf<DiscoveredGateway?>(null) }
     var trustCandidate by remember { mutableStateOf<DiscoveredGateway?>(null) }
+    var rejectedGatewayIp by remember { mutableStateOf<String?>(null) }
     var activeClient by remember { mutableStateOf<GatewayApiClient?>(null) }
 
     val gateways = remember { mutableStateListOf<DiscoveredGateway>() }
@@ -177,6 +179,10 @@ fun Matter2SuplaApp(storage: GatewayStorage) {
                 selectedGateway = null
                 startScan()
             },
+            onSessionRejected = {
+                rejectedGatewayIp = gw.ip
+                activeClient = null
+            },
             onLogout = {
                 storage.clearCredential(gw.ip)
                 activeClient = null
@@ -189,6 +195,8 @@ fun Matter2SuplaApp(storage: GatewayStorage) {
         GatewayLoginScreen(
             gateway = gw,
             initialCredential = storage.getSavedCredential(gw.ip, gw.certSha256) ?: "",
+            sessionRejected = rejectedGatewayIp == gw.ip,
+            onForgetSavedCredential = { storage.clearCredential(gw.ip) },
             onBack = {
                 selectedGateway = null
                 startScan()
@@ -201,6 +209,7 @@ fun Matter2SuplaApp(storage: GatewayStorage) {
                 } else {
                     storage.clearCredential(gw.ip)
                 }
+                if (rejectedGatewayIp == gw.ip) rejectedGatewayIp = null
                 activeClient = newClient
             }
         )
@@ -444,6 +453,8 @@ fun Matter2SuplaApp(storage: GatewayStorage) {
 private fun GatewayLoginScreen(
     gateway: DiscoveredGateway,
     initialCredential: String,
+    sessionRejected: Boolean,
+    onForgetSavedCredential: () -> Unit,
     onBack: () -> Unit,
     onAuthenticated: (GatewayApiClient, Boolean) -> Unit
 ) {
@@ -452,10 +463,14 @@ private fun GatewayLoginScreen(
     var rememberPass by remember { mutableStateOf(initialCredential.isNotBlank()) }
     var checking by remember { mutableStateOf(false) }
     var certificateChanged by remember { mutableStateOf(false) }
-    var errorMsg by remember { mutableStateOf<String?>(null) }
+    var loginRateLimited by remember { mutableStateOf(false) }
+    var confirmForget by remember { mutableStateOf(sessionRejected && initialCredential.isNotBlank()) }
+    var errorMsg by remember {
+        mutableStateOf(if (sessionRejected) "Bramka odrzuciła sesję. Zaloguj się ponownie." else null)
+    }
 
     fun tryLogin(cred: String) {
-        if (checking || certificateChanged || cred.isBlank()) return
+        if (checking || certificateChanged || loginRateLimited || cred.isBlank()) return
         checking = true
         scope.launch {
             errorMsg = null
@@ -465,6 +480,11 @@ private fun GatewayLoginScreen(
             if (res.errorType == ApiError.CERTIFICATE) {
                 certificateChanged = true
                 errorMsg = "Certyfikat bramki się zmienił. Wróć do listy bramek i potwierdź nowy odcisk."
+            } else if (res.code == 429) {
+                loginRateLimited = true
+                errorMsg = "Bramka ograniczyła próby logowania. Zaczekaj przed kolejną próbą."
+                delay(res.retryAfterMs.coerceAtLeast(60_000L))
+                loginRateLimited = false
             } else if (res.json?.optBoolean("setup_required") == true) {
                 errorMsg = "Najpierw ustaw hasło administratora w panelu WWW bramki."
             } else if (res.isOk && res.json?.optJSONObject("system") != null) {
@@ -478,9 +498,28 @@ private fun GatewayLoginScreen(
     }
 
     LaunchedEffect(gateway.ip) {
-        if (initialCredential.isNotBlank()) {
+        if (!sessionRejected && initialCredential.isNotBlank()) {
             tryLogin(initialCredential)
         }
+    }
+
+    if (confirmForget) {
+        AlertDialog(
+            onDismissRequest = { confirmForget = false },
+            title = { Text("Usunąć zapisane dane logowania?") },
+            text = { Text("Bramka odrzuciła sesję. Możesz zachować dane albo usunąć je z telefonu.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    onForgetSavedCredential()
+                    credential = ""
+                    rememberPass = false
+                    confirmForget = false
+                }) { Text("Usuń") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmForget = false }) { Text("Zachowaj") }
+            }
+        )
     }
 
     Scaffold(
@@ -549,7 +588,7 @@ private fun GatewayLoginScreen(
                     Spacer(Modifier.height(16.dp))
 
                     Button(
-                        enabled = !checking && (certificateChanged || credential.isNotBlank()),
+                        enabled = !checking && !loginRateLimited && (certificateChanged || credential.isNotBlank()),
                         onClick = { if (certificateChanged) onBack() else tryLogin(credential) },
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF55D47A)),
                         modifier = Modifier.fillMaxWidth()

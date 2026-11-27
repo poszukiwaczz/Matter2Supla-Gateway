@@ -92,11 +92,14 @@ fun NativeGatewayPanelScreen(
     client: GatewayApiClient,
     onBackToList: () -> Unit,
     onCertificateChanged: () -> Unit,
+    onSessionRejected: () -> Unit,
     onLogout: () -> Unit
 ) {
     val scope = rememberCoroutineScope()
     val lifecycleOwner = LocalLifecycleOwner.current
     val certificateChanged by client.certificateChanged.collectAsState()
+    val sessionRejected by client.sessionRejected.collectAsState()
+    val retry = remember(client) { LivePollRetry() }
     var selectedTab by remember { mutableIntStateOf(0) }
     var loading by remember { mutableStateOf(false) }
     var errorMsg by remember { mutableStateOf<String?>(null) }
@@ -139,25 +142,24 @@ fun NativeGatewayPanelScreen(
         }
     }
 
-    suspend fun fetchTabData(tab: Int) {
+    suspend fun fetchTabData(tab: Int): ApiResult {
         val requestedAt = android.os.SystemClock.elapsedRealtime()
         val response = when (tab) {
             1 -> client.getDevices()
             3 -> client.getDiagnostics()
             else -> client.getStatus()
         }
-        if (response.code == 401) {
-            onLogout()
-            return
-        }
+        if (response.code == 401 || response.errorType == ApiError.CERTIFICATE) return response
         val json = response.json
         if (!response.isOk || json == null || (tab == 1 && json.optJSONArray("devices") == null)) {
             if (tab == 1) readingsStale = true
             val detail = response.json?.optString("message")?.ifBlank { null } ?: response.error
-            errorMsg = if (tab == 1 && devicesJson != null) {
-                "Nie odświeżono pomiarów. Widoczne są ostatnie dostępne odczyty."
-            } else detail ?: "Nie udało się odświeżyć danych (HTTP " + response.code + ")."
-            return
+            errorMsg = when {
+                response.code == 429 -> "Bramka ograniczyła liczbę żądań. Ponowienie po przerwie."
+                tab == 1 && devicesJson != null -> "Nie odświeżono pomiarów. Widoczne są ostatnie dostępne odczyty."
+                else -> detail ?: "Nie udało się odświeżyć danych (HTTP " + response.code + ")."
+            }
+            return response
         }
         errorMsg = null
         when (tab) {
@@ -177,7 +179,13 @@ fun NativeGatewayPanelScreen(
         if ((tab == 0 || tab == 3) && settingsJson == null) {
             val settings = client.get("/api/gateway/settings")
             if (settings.isOk) settingsJson = settings.json
+            else return settings
         }
+        return response
+    }
+
+    LaunchedEffect(sessionRejected) {
+        if (sessionRejected) onSessionRejected()
     }
 
     if (certificateChanged) {
@@ -200,13 +208,16 @@ fun NativeGatewayPanelScreen(
         lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
             loading = true
             try {
-                fetchTabData(tab)
+                while (isActive && !client.certificateChanged.value && !client.sessionRejected.value) {
+                    val response = fetchTabData(tab)
+                    loading = false
+                    if (client.certificateChanged.value || client.sessionRejected.value) break
+                    val waitMs = retry.nextDelay(response.isOk, response.errorType, response.code, response.retryAfterMs)
+                    if (!response.isOk) android.util.Log.d("Matter2SuplaFinder", "LIVE retry in " + waitMs + " ms")
+                    delay(waitMs)
+                }
             } finally {
                 loading = false
-            }
-            while (isActive && !client.certificateChanged.value) {
-                delay(5000L)
-                if (!client.certificateChanged.value) fetchTabData(tab)
             }
         }
     }

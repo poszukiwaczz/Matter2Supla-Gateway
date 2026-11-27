@@ -1,5 +1,7 @@
 package pl.matter2supla.finder
 
+import android.os.SystemClock
+
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
@@ -30,7 +32,8 @@ data class ApiResult(
     val json: JSONObject?,
     val rawBody: String,
     val error: String? = null,
-    val errorType: ApiError = if (code in 200..299) ApiError.NONE else ApiError.HTTP
+    val errorType: ApiError = if (code in 200..299) ApiError.NONE else ApiError.HTTP,
+    val retryAfterMs: Long = 0
 ) {
     val isOk: Boolean get() = code in 200..299 && error == null && json?.optBoolean("ok", true) == true
 }
@@ -64,6 +67,9 @@ class GatewayApiClient(
     private val requestMutex = Mutex()
     private val trustFailure = MutableStateFlow(false)
     val certificateChanged = trustFailure.asStateFlow()
+    private val authFailure = MutableStateFlow(false)
+    val sessionRejected = authFailure.asStateFlow()
+    private var rateLimitedUntilMs = 0L
 
     private fun certificateRejected() = ApiResult(
         code = -1,
@@ -118,6 +124,9 @@ class GatewayApiClient(
         timeoutMs: Int
     ): ApiResult = requestMutex.withLock {
         if (trustFailure.value) return@withLock certificateRejected()
+        if (authFailure.value) return@withLock ApiResult(401, null, "")
+        val cooldown = rateLimitedUntilMs - SystemClock.elapsedRealtime()
+        if (cooldown > 0) return@withLock ApiResult(429, null, "", retryAfterMs = cooldown)
         withContext(Dispatchers.IO) {
             currentCoroutineContext().ensureActive()
             var conn: HttpsURLConnection? = null
@@ -150,6 +159,12 @@ class GatewayApiClient(
                 }
 
                 val statusCode = conn.responseCode
+                if (statusCode == 401) authFailure.value = true
+                val retryAfterMs = if (statusCode == 429) {
+                    val waitSeconds = conn.getHeaderField("Retry-After")?.trim()?.toLongOrNull() ?: 60L
+                    waitSeconds.coerceIn(60L, 86_400L) * 1000
+                } else 0L
+                if (retryAfterMs > 0) rateLimitedUntilMs = SystemClock.elapsedRealtime() + retryAfterMs
                 val stream = if (statusCode in 200..299) conn.inputStream else conn.errorStream
                 val raw = if (stream != null) {
                     BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).use { it.readText() }
@@ -161,7 +176,7 @@ class GatewayApiClient(
                 } catch (_: Exception) {
                     null
                 }
-                ApiResult(code = statusCode, json = parsed, rawBody = raw)
+                ApiResult(code = statusCode, json = parsed, rawBody = raw, retryAfterMs = retryAfterMs)
             } catch (e: CancellationException) {
                 conn?.disconnect()
                 throw e
