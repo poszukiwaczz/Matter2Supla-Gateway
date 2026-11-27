@@ -66,6 +66,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -90,6 +93,7 @@ fun NativeGatewayPanelScreen(
     onLogout: () -> Unit
 ) {
     val scope = rememberCoroutineScope()
+    val lifecycleOwner = LocalLifecycleOwner.current
     var selectedTab by remember { mutableIntStateOf(0) }
     var loading by remember { mutableStateOf(false) }
     var errorMsg by remember { mutableStateOf<String?>(null) }
@@ -173,18 +177,19 @@ fun NativeGatewayPanelScreen(
         }
     }
 
-    LaunchedEffect(selectedTab, refreshRequest, client) {
+    LaunchedEffect(lifecycleOwner, selectedTab, refreshRequest, client) {
         val tab = selectedTab
-        errorMsg = null
-        loading = true
-        try {
-            fetchTabData(tab)
-        } finally {
-            loading = false
-        }
-        while (isActive) {
-            delay(5000L)
-            fetchTabData(tab)
+        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            loading = true
+            try {
+                fetchTabData(tab)
+            } finally {
+                loading = false
+            }
+            while (isActive) {
+                delay(5000L)
+                fetchTabData(tab)
+            }
         }
     }
 
