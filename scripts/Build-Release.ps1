@@ -53,6 +53,10 @@ if (Test-Path -LiteralPath $scratchMain) {
     Remove-Item -LiteralPath $scratchMain -Recurse -Force
 }
 Copy-Item -LiteralPath (Join-Path $source 'main') -Destination $scratchMain -Recurse -Force
+$protocol = Join-Path $root 'firmware\rcp-ota-common'
+$scratchProtocol = Join-Path $work 'rcp-ota-common'
+New-Item -ItemType Directory -Path $scratchProtocol -Force | Out-Null
+Copy-Item -LiteralPath (Join-Path $protocol 'rcp_uart_ota_proto.h') -Destination $scratchProtocol -Force
 foreach ($file in @('CMakeLists.txt','dependencies.lock','partitions_br.csv','sdkconfig','sdkconfig.defaults','sdkconfig.defaults.otbr','sdkconfig.defaults.tandem')) {
     Copy-Item -LiteralPath (Join-Path $source $file) -Destination (Join-Path $work $file) -Force
 }
@@ -63,9 +67,9 @@ $configText = [regex]::Replace($configText, '(?m)^(?:# )?CONFIG_M2S_SINGLE_USB_R
 $configText = $configText.TrimEnd() + "`n$flagLine`n"
 [System.IO.File]::WriteAllText($configPath, $configText, [System.Text.UTF8Encoding]::new($false))
 
-$compiledSources = @(Get-ChildItem -LiteralPath (Join-Path $source 'main') -File -Recurse | ForEach-Object {
-    $relative = $_.FullName.Substring($source.Length + 1)
-    [ordered]@{ file = ('firmware/controller/' + ($relative -replace '\\','/')); sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
+$compiledSources = @(Get-ChildItem -LiteralPath (Join-Path $source 'main'),$protocol -File -Recurse | ForEach-Object {
+    $relative = $_.FullName.Substring($root.Length + 1)
+    [ordered]@{ file = ($relative -replace '\\','/'); sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
 })
 
 $env:ESP_MATTER_PATH = (Join-Path $EspRoot 'esp-matter') -replace '\\','/'

@@ -96,7 +96,7 @@ channelSave.addEventListener("click",function(){action(this,"thread-channel-msg"
   await refreshSettings(epoch);
  }
  });});
-async function refresh(name){if(!api.authorized())return;tab=name;const epoch=api.epoch();if(name==="settings")return refreshSettings(epoch);try{if(name==="diagnostics"){const d=await get("/api/gateway/diagnostics");if(epoch===api.epoch()){renderDiagnostics(d);}}if(name==="maintenance"){const d=await get("/api/gateway/diagnostics");if(epoch===api.epoch())$("update-version").textContent="Wersja S3: "+d.firmware;}if(name==="integrations"){const d=await get("/api/mqtt");if(epoch!==api.epoch())return;$("mqtt-enabled").checked=!!d.enabled;$("mqtt-uri").value=d.uri||"";$("mqtt-user").value=d.user||"";$("mqtt-ca").value=d.ca||"";$("mqtt-status").textContent=d.connected?"Połączono z brokerem":"Nie połączono";}}catch(e){if(epoch===api.epoch())$(name==="diagnostics"?"gateway-diagnostics":name==="maintenance"?"update-version":"mqtt-status").textContent=e.message;}}
+async function refresh(name){if(!api.authorized())return;tab=name;const epoch=api.epoch();if(name==="settings")return refreshSettings(epoch);try{if(name==="diagnostics"){const d=await get("/api/gateway/diagnostics");if(epoch===api.epoch()){renderDiagnostics(d);}}if(name==="maintenance"){const d=await get("/api/gateway/diagnostics");if(epoch===api.epoch()){$("update-version").textContent="Wersja S3: "+d.firmware;const r=d.s3_c6||{};$("gateway-update-rcp").hidden=!r.rcp_ota_status||r.rcp_ota_status==="disabled";}}if(name==="integrations"){const d=await get("/api/mqtt");if(epoch!==api.epoch())return;$("mqtt-enabled").checked=!!d.enabled;$("mqtt-uri").value=d.uri||"";$("mqtt-user").value=d.user||"";$("mqtt-ca").value=d.ca||"";$("mqtt-status").textContent=d.connected?"Połączono z brokerem":"Nie połączono";}}catch(e){if(epoch===api.epoch())$(name==="diagnostics"?"gateway-diagnostics":name==="maintenance"?"update-version":"mqtt-status").textContent=e.message;}}
 $("gateway-backup").addEventListener("click",function(){action(this,"backup-result",async epoch=>{const password=$("backup-password").value;if(password.length<12)throw Error("Wpisz hasło kopii: minimum12 znaków.");const snapshot=await api.post("/api/gateway/backup",{});const encrypted=await encrypt(snapshot,password);if(epoch!==api.epoch())return;api.download("matter2supla-backup-encrypted.json",JSON.stringify(encrypted),"application/json");lastBackup=true;if(backupRequired){backupRequired=false;$("update-status").textContent="Kopia gotowa. Możesz rozpocząć aktualizację S3.";}$("backup-result").textContent="Pobrano szyfrowaną kopię. Zachowaj hasło w bezpiecznym miejscu.";});});
 $("gateway-restore-preview").addEventListener("click",function(){action(this,"backup-result",async epoch=>{restoreData=null;$("gateway-restore").disabled=true;const file=$("backup-file").files[0];if(!file||file.size>160000)throw Error("Wybierz poprawny plik kopii.");const snapshot=await decrypt(JSON.parse(await file.text()),$("backup-password").value);if(epoch!==api.epoch())return;restoreData=snapshot.simulated?null:snapshot;$("backup-preview").textContent="Kopia NVS tej samej płytki i tożsamości SUPLA.\nLiczba urządzeń: "+snapshot.devices+"\nOdtworzenie przywróci zapisany stan urządzeń, kanałów, sieci i haseł; późniejsze zmiany zostaną zastąpione. Historia w Cloud nie jest przenoszona ani usuwana. Bramka zrestartuje się.";$("gateway-restore").disabled=!!snapshot.simulated;if(snapshot.simulated)$("backup-preview").textContent="DEMO: to podgląd szyfrowania, nie prawdziwa kopia urządzenia.";});});
 $("gateway-restore").addEventListener("click",function(){action(this,"backup-result",async epoch=>{if(!restoreData||!confirm("Odtworzyć sprawdzoną kopię i zrestartować bramkę? Bieżąca konfiguracja zostanie zastąpiona kopią."))return;const data=restoreData;restoreData=null;const result=await api.post("/api/gateway/restore",data);if(epoch===api.epoch())$("backup-result").textContent=result.message;});});
@@ -124,7 +124,38 @@ async function verifyUpdateBoot(version,epoch,accepted){
       "Nie potwierdzono uruchomienia "+version+"."+(lastVersion?" Ostatnia odczytana wersja: "+lastVersion+".":"");
   }
 }
-$("gateway-update").addEventListener("click",function(){return action(this,"update-status",async epoch=>{
+async function verifyRcpBoot(build,version,epoch){
+  const deadline=Date.now()+690000;
+  while(epoch===api.epoch() && Date.now()<deadline){
+    await new Promise(resolve=>setTimeout(resolve,5000));
+    if(epoch!==api.epoch())return;
+    try{
+      const response=await api.request("/api/gateway/diagnostics",{cache:"no-store",timeoutMs:3500});
+      const d=await response.json();
+      if(epoch!==api.epoch())return;
+      const fields=String((d.s3_c6||{}).rcp_ota_status||"").split(":");
+      if(Number(fields[1])!==build)continue;
+      if(fields[0]==="confirmed"){
+        $("update-status").textContent="C6 uruchomił i zatwierdził "+version+" (build "+build+").";
+        return;
+      }
+      if(fields[0]==="rolled_back"){
+        $("update-status").textContent="C6 wrócił do poprzedniego slotu.";
+        return;
+      }
+      if(fields[0].startsWith("failed")||fields[0]==="rejected_downgrade"){
+        $("update-status").textContent="Nie potwierdzono aktualizacji C6 ("+fields[0]+"). Sprawdź Diagnostykę.";
+        return;
+      }
+    }catch(_){/* Panel can be unavailable while S3 restarts. */}
+  }
+  if(epoch===api.epoch())$("update-status").textContent="Nie potwierdzono działania nowej wersji C6. Otwórz Diagnostykę.";
+}
+let firmwareUpdateBusy=false;
+async function installFirmware(button,targetC6){
+ if(firmwareUpdateBusy)return;
+ firmwareUpdateBusy=true;
+ try{return await action(button,"update-status",async epoch=>{
   const status=$("update-status");
   if(!lastBackup){backupRequired=true;throw Error("Najpierw pobierz szyfrowaną kopię bramki.");}
   const file=$("update-file").files[0];
@@ -137,6 +168,8 @@ $("gateway-update").addEventListener("click",function(){return action(this,"upda
   const isC6=magic==="M2SRCP1"&&v.getUint32(8,true)===1&&v.getUint32(12,true)===13&&v.getUint32(16,true)===image.byteLength-170;
   if(!isS3&&!isC6)
     throw Error("Pakiet nie jest poprawnym podpisanym obrazem S3 (M2SOTA3) ani radia C6 (M2SRCP1).");
+  if(isC6!==targetC6)throw Error(targetC6?"Wybierz podpisany pakiet radia C6.":"Wybierz podpisany pakiet S3 albo użyj przycisku Aktualizuj radio C6.");
+  const build=v.getUint32(20,true);
   const version=decoder.decode(new Uint8Array(image,24,32)).replace(/\0.*$/,"");
   const targetLabel=isC6?"radia ESP32-C6 po kablu USB-C (UART1)":"bramki ESP32-S3";
   if(!confirm("Zainstalować podpisaną wersję "+version+" dla "+targetLabel+"? Bramka uruchomi się ponownie.")){
@@ -152,7 +185,8 @@ $("gateway-update").addEventListener("click",function(){return action(this,"upda
     if(epoch!==api.epoch())return;
     if(error.responseReceived)throw error;
     if(isC6){
-      status.textContent="Utracono odpowiedź podczas przesyłania obrazu C6. Sprawdź Diagnostykę po restarcie bramki.";
+      status.textContent="Utracono odpowiedź. Sprawdzam wynik aktualizacji C6 po restarcie…";
+      await verifyRcpBoot(build,version,epoch);
       return;
     }
     status.textContent="Utracono odpowiedź podczas aktualizacji. Sprawdzam, jaka wersja działa…";
@@ -161,12 +195,16 @@ $("gateway-update").addEventListener("click",function(){return action(this,"upda
   }
   if(epoch!==api.epoch())return;
   if(isC6){
-    status.textContent="Obraz C6 zweryfikowany i zapisany w rcp_fw. S3 restartuje się, aby wgrać radio C6 po UART1 (~15 s)…";
+    status.textContent="Paczka C6 zapisana na S3. Czekam na przesłanie i potwierdzenie po restarcie…";
+    await verifyRcpBoot(build,version,epoch);
     return;
   }
   status.textContent="Obraz zweryfikowany. Czekam na restart i odpowiedź bramki…";
   await verifyUpdateBoot(version,epoch,true);
-});});
+ });}finally{firmwareUpdateBusy=false;}
+}
+$("gateway-update").addEventListener("click",function(){return installFirmware(this,false);});
+$("gateway-update-rcp").addEventListener("click",function(){return installFirmware(this,true);});
 $("gateway-rollback").addEventListener("click",function(){action(this,"update-status",async epoch=>{if(!confirm("Uruchomić poprzednią potwierdzoną aplikację lub obraz odzyskiwania? Ustawienia NVS pozostaną bez zmian."))return;const result=await api.post("/api/gateway/rollback",{confirm:"ROLLBACK"});if(epoch===api.epoch())$("update-status").textContent=result.message;});});
 $("cloud-map-download").addEventListener("click",function(){action(this,"cloud-map-result",async epoch=>{const map=await get("/api/gateway/cloud-map");if(epoch!==api.epoch())return;api.download("matter2supla-cloud-map.json",JSON.stringify(map,null,2),"application/json");$("cloud-map-result").textContent="Pobrano mapę numerów kanałów i podurządzeń, bez AuthKey i haseł. To nie zmienia publicznego Cloud.";});});
 $("mqtt-save").addEventListener("click",function(){action(this,"mqtt-status",async epoch=>{const uri=$("mqtt-uri").value.trim();if($("mqtt-enabled").checked&&uri.startsWith("mqtt://")&&!confirm("Wybrano MQTT bez szyfrowania. Kontynuować dla tej sieci lokalnej?"))return;const result=await api.post("/api/mqtt",{enabled:$("mqtt-enabled").checked,uri,user:$("mqtt-user").value,password:$("mqtt-password").value,ca:$("mqtt-ca").value});$("mqtt-password").value="";if(epoch===api.epoch())$("mqtt-status").textContent=result.message;});});

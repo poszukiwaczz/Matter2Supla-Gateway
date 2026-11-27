@@ -13,6 +13,9 @@ New-Item -ItemType Directory -Path $work, $outDir -Force | Out-Null
 Copy-Item "$src\CMakeLists.txt", "$src\partitions.csv", "$src\sdkconfig.defaults", "$src\sdkconfig.defaults.esp32c6" $work -Force
 New-Item -ItemType Directory -Path "$work\main" -Force | Out-Null
 Copy-Item "$src\main\*" "$work\main\" -Recurse -Force
+$protoDst = Join-Path (Split-Path $work -Parent) 'rcp-ota-common'
+New-Item -ItemType Directory -Path $protoDst -Force | Out-Null
+Copy-Item (Join-Path $root 'firmware\rcp-ota-common\rcp_uart_ota_proto.h') $protoDst -Force
 
 $env:CCACHE_DISABLE = '1'
 . (Join-Path $EspRoot 'esp-idf\export.ps1')

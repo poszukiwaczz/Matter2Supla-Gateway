@@ -16,6 +16,7 @@
 #include "esp_openthread.h"
 #include "esp_openthread_lock.h"
 #include "openthread/link_raw.h"
+#include <stdio.h>
 
 #define RCP_OTA_UART_PORT      UART_NUM_1
 #define RCP_OTA_BAUD           2000000
@@ -326,6 +327,28 @@ static bool rcp_host_link_enabled(void)
     return enabled;
 }
 
+const char *__real_otGetVersionString(void);
+
+const char *__wrap_otGetVersionString(void)
+{
+    static char version[128];
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t state;
+    char slot = '?';
+    char health = 'u';
+    if (running) {
+        if (running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0) slot = '0';
+        if (running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_1) slot = '1';
+        if (esp_ota_get_state_partition(running, &state) == ESP_OK) {
+            if (state == ESP_OTA_IMG_VALID) health = 'v';
+            if (state == ESP_OTA_IMG_PENDING_VERIFY) health = 'p';
+        }
+    }
+    snprintf(version, sizeof(version), "m2s-rcp:%lu:%c:%c %s",
+             (unsigned long)RCP_OTA_BUILD, slot, health, __real_otGetVersionString());
+    return version;
+}
+
 static void rcp_ota_confirm_task(void *arg)
 {
     (void)arg;
@@ -334,9 +357,11 @@ static void rcp_ota_confirm_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(1000));
         healthy_s = rcp_host_link_enabled() ? healthy_s + 1 : 0;
         if (healthy_s >= RCP_OTA_CONFIRM_HOLD_S) {
-            esp_ota_mark_app_valid_cancel_rollback();
-            vTaskDelete(NULL);
-            return;
+            if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
+                vTaskDelete(NULL);
+                return;
+            }
+            healthy_s = 0;
         }
     }
     // No working Spinel session with the host: return to the previous RCP image.

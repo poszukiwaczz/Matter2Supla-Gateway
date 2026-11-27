@@ -64,6 +64,27 @@ if(CONFIG_OPENTHREAD_RADIO_SPINEL_UART)
     if(NOT m2s_spinel_replacements EQUAL 1)
         message(FATAL_ERROR "Expected exactly one OpenThread radio Spinel driver source")
     endif()
+    if(CONFIG_M2S_SINGLE_USB_RCP_OTA)
+        set(rcp_port "$ENV{IDF_PATH}/components/openthread/src/port/esp_openthread_radio_spinel.cpp")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${rcp_port}")
+        file(READ "${rcp_port}" rcp_port_text)
+        set(rcp_probe_anchor "const char *otPlatRadioGetVersionString(otInstance *aInstance)")
+        set(rcp_query [=[
+extern "C" bool m2s_read_rcp_ota_version(char *out, size_t capacity)
+{
+    return s_radio.Get(SPINEL_PROP_NCP_VERSION, SPINEL_DATATYPE_UTF8_S, out, capacity) == OT_ERROR_NONE;
+}
+
+]=])
+        string(REPLACE "${rcp_probe_anchor}" "${rcp_query}${rcp_probe_anchor}" patched_rcp_port "${rcp_port_text}")
+        if(patched_rcp_port STREQUAL rcp_port_text)
+            message(FATAL_ERROR "Review the Single USB RCP version query after the ESP-IDF change")
+        endif()
+        set(rcp_port_copy "${CMAKE_CURRENT_BINARY_DIR}/m2s_radio_spinel.cpp")
+        file(WRITE "${rcp_port_copy}" "${patched_rcp_port}")
+        list(FILTER m2s_spinel_sources EXCLUDE REGEX "(^|/)esp_openthread_radio_spinel[.]cpp$")
+        list(APPEND m2s_spinel_sources "${rcp_port_copy}")
+    endif()
     set_property(TARGET ${m2s_openthread_library} PROPERTY SOURCES "${m2s_spinel_sources}")
     target_include_directories(${m2s_openthread_library} PRIVATE "${m2s_spinel_dir}")
 endif()

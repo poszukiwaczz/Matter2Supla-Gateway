@@ -2,6 +2,7 @@
 // Compiled in only with CONFIG_M2S_SINGLE_USB_RCP_OTA; the standard build gets stubs below.
 #include "sdkconfig.h"
 #include "gateway_services.h"
+#include <cstring>
 #if CONFIG_M2S_SINGLE_USB_RCP_OTA
 #include "gateway_formats.h"
 #include "quick_add.h"
@@ -12,7 +13,9 @@
 #include <esp_log.h>
 #include <esp_partition.h>
 #include <esp_timer.h>
-#include <nvs.h>
+#include <atomic>
+#include <cstdarg>
+#include <cstdio>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <mbedtls/pk.h>
@@ -32,7 +35,11 @@ constexpr int kRcpBaud = 2000000;
 constexpr uint32_t kStageOffset = 4096;
 constexpr uint32_t kStageMagic = 0x4D325243u; // "M2RC"
 constexpr uint32_t kStagePending = 0xFFFFFFFEu;
-constexpr uint32_t kStageDone    = 0xFFFFFFFCu;
+constexpr uint32_t kStageVerifying = 0xFFFFFFFCu;
+constexpr uint32_t kStageConfirmed = 0xFFFFFFF8u;
+constexpr uint32_t kStageRolledBack = 0xFFFFFFE0u;
+constexpr int64_t kTransferLimitUs = 45000000;
+constexpr int64_t kVerificationLimitUs = 660000000;
 constexpr uint32_t kStageFailed  = 0xFFFFFFF0u;
 
 extern const uint8_t key_start[] asm("_binary_update_public_key_pem_start");
@@ -48,30 +55,23 @@ struct RcpStageRecord {
 };
 
 char s_rcp_ota_status[96] = "idle";
-uint32_t s_boot_c6_build = 0;
-bool s_boot_c6_build_saved = false;
+portMUX_TYPE s_status_lock = portMUX_INITIALIZER_UNLOCKED;
+std::atomic<bool> s_verifying{false};
+RcpStageRecord s_expected{};
+int64_t s_transfer_deadline = 0;
+int64_t s_verification_deadline = 0;
+bool s_expected_boot_seen = false;
 
-uint32_t read_saved_c6_build()
+void set_status(const char *format, ...)
 {
-    uint32_t build = 0;
-    nvs_handle_t h;
-    if (nvs_open("m2s_rcp", NVS_READONLY, &h) == ESP_OK) {
-        nvs_get_u32(h, "build", &build);
-        nvs_close(h);
-    }
-    return build;
-}
-
-void sync_saved_c6_build()
-{
-    if (s_boot_c6_build == 0 || s_boot_c6_build_saved) return;
-    nvs_handle_t h;
-    if (nvs_open("m2s_rcp", NVS_READWRITE, &h) == ESP_OK) {
-        if (nvs_set_u32(h, "build", s_boot_c6_build) == ESP_OK && nvs_commit(h) == ESP_OK) {
-            s_boot_c6_build_saved = true;
-        }
-        nvs_close(h);
-    }
+    char text[96]{};
+    va_list args;
+    va_start(args, format);
+    vsnprintf(text, sizeof(text), format, args);
+    va_end(args);
+    portENTER_CRITICAL(&s_status_lock);
+    memcpy(s_rcp_ota_status, text, sizeof(text));
+    portEXIT_CRITICAL(&s_status_lock);
 }
 
 const esp_partition_t *rcp_stage_partition()
@@ -196,7 +196,8 @@ bool uart_read_exact(uint8_t *dst, size_t n, int64_t deadline_us)
 
 bool wait_ota_packet(rcp_pkt_header_t &hdr_out, uint8_t *payload_out, size_t max_payload, int timeout_ms)
 {
-    const int64_t deadline_us = esp_timer_get_time() + static_cast<int64_t>(timeout_ms) * 1000LL;
+    int64_t deadline_us = esp_timer_get_time() + static_cast<int64_t>(timeout_ms) * 1000LL;
+    if (deadline_us > s_transfer_deadline) deadline_us = s_transfer_deadline;
     static constexpr uint8_t kMagic[4] = {
         M2S_RCP_OTA_MAGIC0, M2S_RCP_OTA_MAGIC1, M2S_RCP_OTA_MAGIC2, M2S_RCP_OTA_MAGIC3
     };
@@ -259,28 +260,66 @@ bool verify_staged_sha(const esp_partition_t *part, const RcpStageRecord &rec)
     return ok;
 }
 
-void mark_stage_state(const esp_partition_t *part, uint32_t new_state)
+bool mark_stage_state(const esp_partition_t *part, uint32_t new_state)
 {
-    esp_partition_write(part, offsetof(RcpStageRecord, state), &new_state, sizeof(new_state));
+    return part && esp_partition_write(part, offsetof(RcpStageRecord, state), &new_state,
+                                       sizeof(new_state)) == ESP_OK;
+}
+
+void verify_radio_boot(const RcpStageRecord &rec)
+{
+    s_expected = rec;
+    s_expected_boot_seen = false;
+    s_verification_deadline = esp_timer_get_time() + kVerificationLimitUs;
+    set_status("verifying:%lu", (unsigned long)rec.build);
+    s_verifying.store(true);
 }
 
 } // namespace
 
-const char *rcp_ota_status()
+void rcp_ota_status(char (&out)[96])
 {
-    sync_saved_c6_build();
-    return s_rcp_ota_status;
+    portENTER_CRITICAL(&s_status_lock);
+    memcpy(out, s_rcp_ota_status, sizeof(out));
+    portEXIT_CRITICAL(&s_status_lock);
+}
+
+bool rcp_ota_verification_pending() { return s_verifying.load(); }
+
+void rcp_ota_observe(const char *version)
+{
+    if (!s_verifying.load()) return;
+    unsigned long build = 0;
+    char slot = '?', health = '?';
+    const bool reported = version &&
+        sscanf(version, "m2s-rcp:%lu:%c:%c", &build, &slot, &health) == 3 &&
+        (slot == '0' || slot == '1') && (health == 'v' || health == 'p' || health == 'u');
+    if (reported && build == s_expected.build) s_expected_boot_seen = true;
+    const bool confirmed = reported && build == s_expected.build && health == 'v';
+    const bool rolled_back = reported && s_expected_boot_seen && build != s_expected.build;
+    if (!confirmed && !rolled_back && esp_timer_get_time() < s_verification_deadline) return;
+
+    const uint32_t state = confirmed ? kStageConfirmed : rolled_back ? kStageRolledBack : kStageFailed;
+    if (!mark_stage_state(rcp_stage_partition(), state)) {
+        set_status("failed_status_write:%lu", (unsigned long)s_expected.build);
+    } else if (confirmed) {
+        set_status("confirmed:%lu:ota_%c", build, slot);
+    } else if (rolled_back) {
+        set_status("rolled_back:%lu", (unsigned long)s_expected.build);
+    } else {
+        set_status("failed_unconfirmed:%lu", (unsigned long)s_expected.build);
+    }
+    s_verifying.store(false);
 }
 
 esp_err_t update_rcp(httpd_req_t *r)
 {
-    sync_saved_c6_build();
     ESP_LOGI(kTag, "C6 RCP OTA upload request: %u bytes", (unsigned)r->content_len);
     const auto *part = rcp_stage_partition();
     if (!part || part->size < kStageOffset + kRcpAppLimit) {
         return reply(r, 409, "Brak partycji rcp_fw (600 KB) w tablicy partycji S3.");
     }
-    if (mutation_busy()) {
+    if (s_verifying.load() || mutation_busy()) {
         return reply(r, 409, "Bramka jest zajeta.");
     }
     struct Guard { ~Guard() { mutation_done(); } } guard;
@@ -294,13 +333,6 @@ esp_err_t update_rcp(httpd_req_t *r)
         ESP_LOGW(kTag, "Rejected C6 RCP OTA header/signature");
         return reply(r, 400, "Niepoprawny podpis, wersja, chip (C6) lub rozmiar pakietu RCP. Niczego nie zapisano.");
     }
-    const uint32_t known_c6_build = read_saved_c6_build();
-    if (known_c6_build > 0 && h.build <= known_c6_build) {
-        ESP_LOGW(kTag, "Rejected C6 RCP OTA downgrade: upload build=%u <= current=%u",
-                 (unsigned)h.build, (unsigned)known_c6_build);
-        return reply(r, 400, "Pakiet C6 ma starsza lub taka sama wersje buildu. Niczego nie zapisano.");
-    }
-
     constexpr size_t kChunkBytes = 4096;
     auto buf = std::unique_ptr<uint8_t[]>(new (std::nothrow) uint8_t[kChunkBytes]);
     if (!buf) {
@@ -353,6 +385,7 @@ esp_err_t update_rcp(httpd_req_t *r)
         return reply(r, 500, "Nie zapisano naglowka aktualizacji C6 w rcp_fw.");
     }
 
+    set_status("staged:%lu", (unsigned long)rec.build);
     ESP_LOGI(kTag, "Staged signed C6 RCP %s (build %u, %u B). Rebooting S3 to flash C6 over UART1.",
              rec.version, (unsigned)rec.build, (unsigned)rec.image_bytes);
     auto resp = reply(r, 200, "Podpis i obraz C6 poprawne. Restart S3 i zdalna aktualizacja radia C6 po kablu USB-C (UART1)...");
@@ -369,12 +402,14 @@ void apply_pending_rcp_update()
     if (esp_partition_read(part, 0, &rec, sizeof(rec)) != ESP_OK) return;
     if (rec.magic != kStageMagic) return;
 
-    if (rec.state == kStageDone) {
-        snprintf(s_rcp_ota_status, sizeof(s_rcp_ota_status), "done:%s", rec.version);
+    if (rec.state == kStageVerifying) {
+        verify_radio_boot(rec);
         return;
     }
-    if (rec.state == kStageFailed) {
-        snprintf(s_rcp_ota_status, sizeof(s_rcp_ota_status), "failed:%s", rec.version);
+    if (rec.state == kStageConfirmed || rec.state == kStageRolledBack || rec.state == kStageFailed) {
+        const char *state = rec.state == kStageConfirmed ? "confirmed" :
+                            rec.state == kStageRolledBack ? "rolled_back" : "failed";
+        set_status("%s:%lu", state, (unsigned long)rec.build);
         return;
     }
     if (rec.state != kStagePending || rec.image_bytes == 0 || rec.image_bytes > kRcpAppLimit) {
@@ -386,7 +421,7 @@ void apply_pending_rcp_update()
     if (!verify_staged_sha(part, rec)) {
         ESP_LOGE(kTag, "Staged C6 image SHA-256 verification failed; aborting");
         mark_stage_state(part, kStageFailed);
-        snprintf(s_rcp_ota_status, sizeof(s_rcp_ota_status), "failed_sha:%s", rec.version);
+        set_status("failed_sha:%lu", (unsigned long)rec.build);
         return;
     }
 
@@ -401,13 +436,14 @@ void apply_pending_rcp_update()
     };
     if (uart_driver_install(kRcpUartPort, 4096, 4096, 0, nullptr, 0) != ESP_OK) {
         mark_stage_state(part, kStageFailed);
-        snprintf(s_rcp_ota_status, sizeof(s_rcp_ota_status), "failed_uart");
+        set_status("failed_uart:%lu", (unsigned long)rec.build);
         return;
     }
     uart_param_config(kRcpUartPort, &cfg);
     uart_set_pin(kRcpUartPort, kRcpTxPin, kRcpRxPin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     uart_flush_input(kRcpUartPort);
 
+    s_transfer_deadline = esp_timer_get_time() + kTransferLimitUs;
     // Trigger C6 reboot via standard Spinel CMD_RESET(SPINEL_RESET_PLATFORM), then knock until C6 enters OTA boot window.
     bool ready = false;
     rcp_pkt_header_t rx_hdr{};
@@ -420,7 +456,7 @@ void apply_pending_rcp_update()
         uart_flush_input(kRcpUartPort);
 
         const int64_t knock_deadline = esp_timer_get_time() + 2500000LL;
-        while (esp_timer_get_time() < knock_deadline) {
+        while (esp_timer_get_time() < knock_deadline && esp_timer_get_time() < s_transfer_deadline) {
             send_ota_packet(RCP_PKT_KNOCK, 0, nullptr, 0);
             if (wait_ota_packet(rx_hdr, rx_payload, sizeof(rx_payload), 40) && rx_hdr.type == RCP_PKT_READY) {
                 ready = true;
@@ -429,22 +465,21 @@ void apply_pending_rcp_update()
         }
     }
 
-    bool transferred = false;
+    bool commit_attempted = false;
+    bool commit_acknowledged = false;
     if (!ready) {
         ESP_LOGE(kTag, "C6 did not respond to UART1 OTA knock (is C6 flashed with 2xOTA RCP firmware?)");
-        snprintf(s_rcp_ota_status, sizeof(s_rcp_ota_status), "failed_no_c6_ota_reply");
+        set_status("failed_no_c6_ota_reply:%lu", (unsigned long)rec.build);
     } else {
         rcp_ready_payload_t c6_info{};
         if (rx_hdr.len >= sizeof(c6_info)) memcpy(&c6_info, rx_payload, sizeof(c6_info));
         ESP_LOGI(kTag, "C6 READY in OTA mode (current_build=%u, slot=ota_%u)",
                  (unsigned)c6_info.current_build, (unsigned)c6_info.running_slot);
-        s_boot_c6_build = c6_info.current_build;
 
         if (c6_info.current_build > 0 && rec.build <= c6_info.current_build) {
             ESP_LOGW(kTag, "Rejected C6 downgrade at boot: staged build=%u <= C6 current=%u",
                      (unsigned)rec.build, (unsigned)c6_info.current_build);
-            snprintf(s_rcp_ota_status, sizeof(s_rcp_ota_status), "rejected_downgrade:%u<=%u",
-                     (unsigned)rec.build, (unsigned)c6_info.current_build);
+            set_status("rejected_downgrade:%lu", (unsigned long)rec.build);
         } else {
         rcp_begin_payload_t begin_msg{};
         begin_msg.image_bytes = rec.image_bytes;
@@ -452,14 +487,14 @@ void apply_pending_rcp_update()
         memcpy(begin_msg.sha256, rec.sha, 32);
 
         bool began = false;
-        for (int tries = 0; tries < 5 && !began; ++tries) {
+        for (int tries = 0; tries < 5 && !began && esp_timer_get_time() < s_transfer_deadline; ++tries) {
             send_ota_packet(RCP_PKT_BEGIN, 0, &begin_msg, sizeof(begin_msg));
             if (wait_ota_packet(rx_hdr, rx_payload, sizeof(rx_payload), 3000)) {
                 if (rx_hdr.type == RCP_PKT_ACK && rx_hdr.seq == 0) {
                     began = true;
                 } else if (rx_hdr.type == RCP_PKT_NACK && rx_hdr.len >= 1 && rx_payload[0] == RCP_OTA_ERR_DOWNGRADE) {
                     ESP_LOGW(kTag, "C6 rejected downgrade (build=%u)", (unsigned)rec.build);
-                    snprintf(s_rcp_ota_status, sizeof(s_rcp_ota_status), "rejected_downgrade");
+                    set_status("rejected_downgrade:%lu", (unsigned long)rec.build);
                     break;
                 }
             }
@@ -479,7 +514,7 @@ void apply_pending_rcp_update()
                     break;
                 }
                 bool acked = false;
-                for (int tries = 0; tries < 5 && !acked; ++tries) {
+                for (int tries = 0; tries < 5 && !acked && esp_timer_get_time() < s_transfer_deadline; ++tries) {
                     send_ota_packet(RCP_PKT_CHUNK, seq, chunk_buf.get(), n);
                     if (wait_ota_packet(rx_hdr, rx_payload, sizeof(rx_payload), 1500) &&
                         rx_hdr.type == RCP_PKT_ACK && rx_hdr.seq == seq) {
@@ -496,13 +531,15 @@ void apply_pending_rcp_update()
                 seq++;
             }
 
-            if (chunks_ok) {
-                for (int tries = 0; tries < 3 && !transferred; ++tries) {
+            if (chunks_ok && esp_timer_get_time() < s_transfer_deadline &&
+                mark_stage_state(part, kStageVerifying)) {
+                // Save the uncertainty before asking C6 to change its boot slot.
+                commit_attempted = true;
+                for (int tries = 0; tries < 2 && !commit_acknowledged &&
+                     esp_timer_get_time() < s_transfer_deadline; ++tries) {
                     send_ota_packet(RCP_PKT_COMMIT, seq, nullptr, 0);
-                    if (wait_ota_packet(rx_hdr, rx_payload, sizeof(rx_payload), 5000) &&
-                        rx_hdr.type == RCP_PKT_ACK && rx_hdr.seq == 0xFFFFFFFFu) {
-                        transferred = true;
-                    }
+                    commit_acknowledged = wait_ota_packet(rx_hdr, rx_payload, sizeof(rx_payload), 2500) &&
+                        rx_hdr.type == RCP_PKT_ACK && rx_hdr.seq == 0xFFFFFFFFu;
                 }
             }
         }
@@ -511,18 +548,20 @@ void apply_pending_rcp_update()
 
     uart_driver_delete(kRcpUartPort);
 
-    if (transferred) {
-        s_boot_c6_build = rec.build;
-        mark_stage_state(part, kStageDone);
-        snprintf(s_rcp_ota_status, sizeof(s_rcp_ota_status), "done:%s", rec.version);
-        ESP_LOGI(kTag, "C6 RCP OTA %s committed! Waiting 600ms for C6 reboot...", rec.version);
+    if (commit_attempted) {
+        ESP_LOGI(kTag, "C6 commit ACK: %s; waiting for the running image",
+                 commit_acknowledged ? "received" : "missing");
+        verify_radio_boot(rec);
         vTaskDelay(pdMS_TO_TICKS(600));
     } else {
-        mark_stage_state(part, kStageFailed);
-        if (strcmp(s_rcp_ota_status, "idle") == 0) {
-            snprintf(s_rcp_ota_status, sizeof(s_rcp_ota_status), "failed_transfer:%s", rec.version);
+        if (!mark_stage_state(part, kStageFailed)) {
+            set_status("failed_status_write:%lu", (unsigned long)rec.build);
+        } else {
+            char previous[96];
+            rcp_ota_status(previous);
+            if (strcmp(previous, "idle") == 0) set_status("failed_transfer:%lu", (unsigned long)rec.build);
         }
-        ESP_LOGE(kTag, "C6 RCP OTA failed (%s); continuing normal S3 boot", s_rcp_ota_status);
+        ESP_LOGE(kTag, "C6 RCP transfer ended without committing; continuing normal S3 boot");
     }
 }
 
@@ -536,7 +575,9 @@ esp_err_t update_rcp(httpd_req_t *r)
     return reply(r, 404, "Ta wersja bramki nie obsluguje zdalnej aktualizacji C6 (wariant single-USB).");
 }
 void apply_pending_rcp_update() {}
-const char *rcp_ota_status() { return "disabled"; }
+void rcp_ota_status(char (&out)[96]) { memcpy(out, "disabled", sizeof("disabled")); }
+bool rcp_ota_verification_pending() { return false; }
+void rcp_ota_observe(const char *) {}
 } // namespace gateway
 
 #endif // CONFIG_M2S_SINGLE_USB_RCP_OTA

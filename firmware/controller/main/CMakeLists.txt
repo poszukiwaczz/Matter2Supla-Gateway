@@ -5,7 +5,7 @@ endif()
 
 idf_component_register(SRC_DIRS          ${SRC_DIRS_LIST}
                        INCLUDE_DIRS      "."
-                       PRIV_INCLUDE_DIRS  "." "${ESP_MATTER_PATH}/examples/common/utils"
+                       PRIV_INCLUDE_DIRS  "." "../rcp-ota-common" "${ESP_MATTER_PATH}/examples/common/utils"
                        EMBED_TXTFILES     "www/theme.js"
                                           "www/index.html"
                                           "www/app.js"
