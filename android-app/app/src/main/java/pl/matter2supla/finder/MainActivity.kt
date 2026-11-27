@@ -172,6 +172,11 @@ fun Matter2SuplaApp(storage: GatewayStorage) {
                 activeClient = null
                 selectedGateway = null
             },
+            onCertificateChanged = {
+                activeClient = null
+                selectedGateway = null
+                startScan()
+            },
             onLogout = {
                 storage.clearCredential(gw.ip)
                 activeClient = null
@@ -184,7 +189,10 @@ fun Matter2SuplaApp(storage: GatewayStorage) {
         GatewayLoginScreen(
             gateway = gw,
             initialCredential = storage.getSavedCredential(gw.ip, gw.certSha256) ?: "",
-            onBack = { selectedGateway = null },
+            onBack = {
+                selectedGateway = null
+                startScan()
+            },
             onAuthenticated = { newClient, rememberPass ->
                 if (rememberPass) {
                     if (!storage.saveCredential(gw.ip, gw.certSha256, newClient.credential)) {
@@ -443,17 +451,21 @@ private fun GatewayLoginScreen(
     var credential by remember { mutableStateOf(initialCredential) }
     var rememberPass by remember { mutableStateOf(initialCredential.isNotBlank()) }
     var checking by remember { mutableStateOf(false) }
+    var certificateChanged by remember { mutableStateOf(false) }
     var errorMsg by remember { mutableStateOf<String?>(null) }
 
     fun tryLogin(cred: String) {
-        if (checking || cred.isBlank()) return
+        if (checking || certificateChanged || cred.isBlank()) return
         checking = true
         scope.launch {
             errorMsg = null
             val client = GatewayApiClient(gateway.ip, gateway.certSha256, cred.trim())
             val res = client.getStatus()
             checking = false
-            if (res.json?.optBoolean("setup_required") == true) {
+            if (res.errorType == ApiError.CERTIFICATE) {
+                certificateChanged = true
+                errorMsg = "Certyfikat bramki się zmienił. Wróć do listy bramek i potwierdź nowy odcisk."
+            } else if (res.json?.optBoolean("setup_required") == true) {
                 errorMsg = "Najpierw ustaw hasło administratora w panelu WWW bramki."
             } else if (res.isOk && res.json?.optJSONObject("system") != null) {
                 onAuthenticated(client, rememberPass)
@@ -537,13 +549,17 @@ private fun GatewayLoginScreen(
                     Spacer(Modifier.height(16.dp))
 
                     Button(
-                        enabled = !checking && credential.isNotBlank(),
-                        onClick = { tryLogin(credential) },
+                        enabled = !checking && (certificateChanged || credential.isNotBlank()),
+                        onClick = { if (certificateChanged) onBack() else tryLogin(credential) },
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF55D47A)),
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Text(
-                            text = if (checking) "Łączenie..." else "Zaloguj się",
+                            text = when {
+                                certificateChanged -> "Wróć do listy bramek"
+                                checking -> "Łączenie..."
+                                else -> "Zaloguj się"
+                            },
                             color = Color(0xFF062111),
                             fontWeight = FontWeight.SemiBold
                         )

@@ -2,12 +2,17 @@ package pl.matter2supla.finder
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.InputStreamReader
+import java.net.SocketTimeoutException
 import java.net.URL
 import java.security.SecureRandom
 import java.security.cert.CertificateException
@@ -15,13 +20,17 @@ import java.security.cert.X509Certificate
 import javax.net.ssl.HostnameVerifier
 import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLPeerUnverifiedException
 import javax.net.ssl.X509TrustManager
+
+enum class ApiError { NONE, CERTIFICATE, NETWORK, TIMEOUT, HTTP }
 
 data class ApiResult(
     val code: Int,
     val json: JSONObject?,
     val rawBody: String,
-    val error: String? = null
+    val error: String? = null,
+    val errorType: ApiError = if (code in 200..299) ApiError.NONE else ApiError.HTTP
 ) {
     val isOk: Boolean get() = code in 200..299 && error == null && json?.optBoolean("ok", true) == true
 }
@@ -53,6 +62,16 @@ class GatewayApiClient(
 
     // Serialize all HTTP requests to ESP32-S3 so tab switches never open concurrent TLS sockets.
     private val requestMutex = Mutex()
+    private val trustFailure = MutableStateFlow(false)
+    val certificateChanged = trustFailure.asStateFlow()
+
+    private fun certificateRejected() = ApiResult(
+        code = -1,
+        json = null,
+        rawBody = "",
+        error = "Certyfikat bramki się zmienił.",
+        errorType = ApiError.CERTIFICATE
+    )
 
     suspend fun get(path: String, timeoutMs: Int = 5000): ApiResult =
         request("GET", path, null, timeoutMs)
@@ -98,7 +117,9 @@ class GatewayApiClient(
         body: String?,
         timeoutMs: Int
     ): ApiResult = requestMutex.withLock {
+        if (trustFailure.value) return@withLock certificateRejected()
         withContext(Dispatchers.IO) {
+            currentCoroutineContext().ensureActive()
             var conn: HttpsURLConnection? = null
             try {
                 val url = URL("https://$ip$path")
@@ -146,12 +167,20 @@ class GatewayApiClient(
                 throw e
             } catch (e: Exception) {
                 conn?.disconnect()
-                ApiResult(
-                    code = -1,
-                    json = null,
-                    rawBody = "",
-                    error = e.message ?: e.javaClass.simpleName
-                )
+                if (generateSequence<Throwable>(e) { it.cause }.any {
+                    it is CertificateException || it is SSLPeerUnverifiedException
+                }) {
+                    trustFailure.value = true
+                    certificateRejected()
+                } else {
+                    ApiResult(
+                        code = -1,
+                        json = null,
+                        rawBody = "",
+                        error = e.message ?: e.javaClass.simpleName,
+                        errorType = if (e is SocketTimeoutException) ApiError.TIMEOUT else ApiError.NETWORK
+                    )
+                }
             }
         }
     }

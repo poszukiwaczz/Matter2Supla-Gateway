@@ -53,6 +53,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -90,10 +91,12 @@ fun NativeGatewayPanelScreen(
     gateway: DiscoveredGateway,
     client: GatewayApiClient,
     onBackToList: () -> Unit,
+    onCertificateChanged: () -> Unit,
     onLogout: () -> Unit
 ) {
     val scope = rememberCoroutineScope()
     val lifecycleOwner = LocalLifecycleOwner.current
+    val certificateChanged by client.certificateChanged.collectAsState()
     var selectedTab by remember { mutableIntStateOf(0) }
     var loading by remember { mutableStateOf(false) }
     var errorMsg by remember { mutableStateOf<String?>(null) }
@@ -177,6 +180,21 @@ fun NativeGatewayPanelScreen(
         }
     }
 
+    if (certificateChanged) {
+        Column(
+            modifier = Modifier.fillMaxSize().padding(24.dp),
+            verticalArrangement = Arrangement.Center
+        ) {
+            Text(
+                "Certyfikat bramki się zmienił. Wróć do listy bramek i potwierdź nowy odcisk.",
+                color = ErrorRed
+            )
+            Spacer(Modifier.height(12.dp))
+            Button(onClick = onCertificateChanged) { Text("Wróć do listy bramek") }
+        }
+        return
+    }
+
     LaunchedEffect(lifecycleOwner, selectedTab, refreshRequest, client) {
         val tab = selectedTab
         lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
@@ -186,9 +204,9 @@ fun NativeGatewayPanelScreen(
             } finally {
                 loading = false
             }
-            while (isActive) {
+            while (isActive && !client.certificateChanged.value) {
                 delay(5000L)
-                fetchTabData(tab)
+                if (!client.certificateChanged.value) fetchTabData(tab)
             }
         }
     }
