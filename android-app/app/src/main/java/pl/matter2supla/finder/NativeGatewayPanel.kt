@@ -106,6 +106,7 @@ fun NativeGatewayPanelScreen(
 
     var statusJson by remember { mutableStateOf<JSONObject?>(null) }
     var settingsJson by remember { mutableStateOf<JSONObject?>(null) }
+    var nextSettingsAtMs by remember(client) { mutableStateOf(0L) }
     var devicesJson by remember { mutableStateOf<JSONArray?>(null) }
     var diagJson by remember { mutableStateOf<JSONObject?>(null) }
 
@@ -142,8 +143,16 @@ fun NativeGatewayPanelScreen(
         }
     }
 
-    suspend fun fetchTabData(tab: Int): ApiResult {
+    suspend fun fetchTabData(tab: Int, allowSettings: Boolean): ApiResult {
         val requestedAt = android.os.SystemClock.elapsedRealtime()
+        val fetchSettings = allowSettings && (tab == 0 || tab == 3) &&
+            errorMsg == null && requestedAt >= nextSettingsAtMs
+        if (fetchSettings) {
+            nextSettingsAtMs = requestedAt + 60_000
+            val settings = client.get("/api/gateway/settings")
+            if (settings.isOk) settingsJson = settings.json
+            return settings
+        }
         val response = when (tab) {
             1 -> client.getDevices()
             3 -> client.getDiagnostics()
@@ -176,11 +185,6 @@ fun NativeGatewayPanelScreen(
             3 -> diagJson = json
             else -> statusJson = json
         }
-        if ((tab == 0 || tab == 3) && settingsJson == null) {
-            val settings = client.get("/api/gateway/settings")
-            if (settings.isOk) settingsJson = settings.json
-            else return settings
-        }
         return response
     }
 
@@ -207,9 +211,11 @@ fun NativeGatewayPanelScreen(
         val tab = selectedTab
         lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
             loading = true
+            var firstCycle = true
             try {
                 while (isActive && !client.certificateChanged.value && !client.sessionRejected.value) {
-                    val response = fetchTabData(tab)
+                    val response = fetchTabData(tab, allowSettings = !firstCycle)
+                    firstCycle = false
                     loading = false
                     if (client.certificateChanged.value || client.sessionRejected.value) break
                     val waitMs = retry.nextDelay(response.isOk, response.errorType, response.code, response.retryAfterMs)
