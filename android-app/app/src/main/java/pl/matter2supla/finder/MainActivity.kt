@@ -1,6 +1,7 @@
 package pl.matter2supla.finder
 
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.BorderStroke
@@ -103,6 +104,7 @@ fun Matter2SuplaApp(storage: GatewayStorage) {
     val scope = rememberCoroutineScope()
 
     var selectedGateway by remember { mutableStateOf<DiscoveredGateway?>(null) }
+    var trustCandidate by remember { mutableStateOf<DiscoveredGateway?>(null) }
     var activeClient by remember { mutableStateOf<GatewayApiClient?>(null) }
 
     val gateways = remember { mutableStateListOf<DiscoveredGateway>() }
@@ -114,14 +116,28 @@ fun Matter2SuplaApp(storage: GatewayStorage) {
     var manualError by remember { mutableStateOf<String?>(null) }
     var scanJob by remember { mutableStateOf<Job?>(null) }
 
-    fun startScan() {
+    fun openGateway(gateway: DiscoveredGateway) {
         scanJob?.cancel()
+        isScanning = false
+        if (gateway.certSha256 == storage.getTrustedFingerprint(gateway.ip)) {
+            storage.saveIp(gateway.ip)
+            selectedGateway = gateway
+        } else {
+            trustCandidate = gateway
+        }
+    }
+
+    fun startScan() {
+        val previous = scanJob
+        previous?.cancel()
         gateways.clear()
         localIp = GatewayDiscovery.getLocalWifiIpv4(context)
         isScanning = true
         scannedCount = 0
         totalCount = 0
         scanJob = scope.launch {
+            previous?.join()
+            isScanning = true
             try {
                 GatewayDiscovery.scanNetwork(
                     context = context,
@@ -167,11 +183,13 @@ fun Matter2SuplaApp(storage: GatewayStorage) {
     if (gw != null) {
         GatewayLoginScreen(
             gateway = gw,
-            initialCredential = storage.getSavedCredential(gw.ip) ?: "",
+            initialCredential = storage.getSavedCredential(gw.ip, gw.certSha256) ?: "",
             onBack = { selectedGateway = null },
             onAuthenticated = { newClient, rememberPass ->
                 if (rememberPass) {
-                    storage.saveCredential(gw.ip, newClient.credential)
+                    if (!storage.saveCredential(gw.ip, gw.certSha256, newClient.credential)) {
+                        Toast.makeText(context, "Nie udało się zapamiętać danych logowania.", Toast.LENGTH_LONG).show()
+                    }
                 } else {
                     storage.clearCredential(gw.ip)
                 }
@@ -304,16 +322,43 @@ fun Matter2SuplaApp(storage: GatewayStorage) {
                     items(gateways, key = { it.ip }) { item ->
                         GatewayCard(
                             gateway = item,
-                            onOpen = {
-                                storage.saveIp(item.ip)
-                                storage.saveTrustedFingerprint(item.ip, item.certSha256)
-                                selectedGateway = item
-                            }
+                            onOpen = { openGateway(item) }
                         )
                     }
                 }
             }
         }
+    }
+
+    trustCandidate?.let { candidate ->
+        val previous = storage.getTrustedFingerprint(candidate.ip)
+        AlertDialog(
+            onDismissRequest = { trustCandidate = null },
+            title = { Text(if (previous == null) "Certyfikat bramki" else "Certyfikat bramki się zmienił") },
+            text = {
+                Column {
+                    Text("Porównaj odcisk SHA-256 z certyfikatem bramki przed zalogowaniem.")
+                    Text(candidate.ip, fontWeight = FontWeight.SemiBold)
+                    Text(candidate.certSha256.chunked(4).joinToString(" "))
+                    if (previous != null) {
+                        Spacer(Modifier.height(8.dp))
+                        Text("Zapisany odcisk: " + previous.chunked(4).joinToString(" "))
+                        Text("Jeśli potwierdzisz zmianę, wpiszesz dane logowania ponownie.")
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    storage.saveTrustedFingerprint(candidate.ip, candidate.certSha256)
+                    storage.saveIp(candidate.ip)
+                    trustCandidate = null
+                    selectedGateway = candidate
+                }) { Text("Potwierdzam odcisk") }
+            },
+            dismissButton = {
+                TextButton(onClick = { trustCandidate = null }) { Text("Anuluj") }
+            }
+        )
     }
 
     if (showManualDialog) {
@@ -360,10 +405,8 @@ fun Matter2SuplaApp(storage: GatewayStorage) {
                                 if (gateways.none { it.ip == found.ip }) {
                                     gateways.add(0, found)
                                 }
-                                storage.saveIp(found.ip)
-                                storage.saveTrustedFingerprint(found.ip, found.certSha256)
                                 showManualDialog = false
-                                selectedGateway = found
+                                openGateway(found)
                             } else {
                                 manualError = "Nie wykryto bramki Matter2Supla pod tym IP (port 443)."
                             }
@@ -398,19 +441,21 @@ private fun GatewayLoginScreen(
 ) {
     val scope = rememberCoroutineScope()
     var credential by remember { mutableStateOf(initialCredential) }
-    var rememberPass by remember { mutableStateOf(true) }
+    var rememberPass by remember { mutableStateOf(initialCredential.isNotBlank()) }
     var checking by remember { mutableStateOf(false) }
     var errorMsg by remember { mutableStateOf<String?>(null) }
 
     fun tryLogin(cred: String) {
-        if (cred.isBlank()) return
+        if (checking || cred.isBlank()) return
+        checking = true
         scope.launch {
-            checking = true
             errorMsg = null
             val client = GatewayApiClient(gateway.ip, gateway.certSha256, cred.trim())
             val res = client.getStatus()
             checking = false
-            if (res.isOk) {
+            if (res.json?.optBoolean("setup_required") == true) {
+                errorMsg = "Najpierw ustaw hasło administratora w panelu WWW bramki."
+            } else if (res.isOk && res.json?.optJSONObject("system") != null) {
                 onAuthenticated(client, rememberPass)
             } else {
                 errorMsg = res.json?.optString("message")?.ifEmpty { null }

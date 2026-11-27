@@ -99,74 +99,92 @@ fun NativeGatewayPanelScreen(
     var devicesJson by remember { mutableStateOf<JSONArray?>(null) }
     var diagJson by remember { mutableStateOf<JSONObject?>(null) }
 
-    suspend fun fetchTabData(tab: Int, showSpinner: Boolean) {
-        if (showSpinner) loading = true
-        when (tab) {
-            0 -> {
-                val res = client.getStatus()
-                if (settingsJson == null) {
-                    val setRes = client.get("/api/gateway/settings")
-                    if (setRes.isOk && setRes.json != null) settingsJson = setRes.json
-                }
-                if (res.isOk && res.json != null) {
-                    statusJson = res.json
-                    errorMsg = null
-                } else if (showSpinner) {
-                    errorMsg = res.json?.optString("message")?.ifEmpty { null } ?: res.error ?: "Błąd HTTP ${res.code}"
-                }
-            }
-            1 -> {
-                val res = client.getDevices()
-                if (res.isOk && res.json != null) {
-                    devicesJson = res.json.optJSONArray("devices")
-                    errorMsg = null
-                } else if (showSpinner) {
-                    errorMsg = res.json?.optString("message")?.ifEmpty { null } ?: res.error ?: "Błąd HTTP ${res.code}"
-                }
-            }
-            2 -> {
-                val res = client.getStatus()
-                if (res.isOk && res.json != null) {
-                    statusJson = res.json
-                    errorMsg = null
-                }
-            }
-            3 -> {
-                val res = client.getDiagnostics()
-                if (settingsJson == null) {
-                    val setRes = client.get("/api/gateway/settings")
-                    if (setRes.isOk && setRes.json != null) settingsJson = setRes.json
-                }
-                if (res.isOk && res.json != null) {
-                    diagJson = res.json
-                    errorMsg = null
-                } else if (showSpinner) {
-                    errorMsg = res.json?.optString("message")?.ifEmpty { null } ?: res.error ?: "Błąd HTTP ${res.code}"
-                }
-            }
-        }
-        if (showSpinner) loading = false
+    var refreshRequest by remember { mutableIntStateOf(0) }
+    var pairingAttempt by remember { mutableStateOf<PairingAttempt?>(null) }
+    var readingsStale by remember { mutableStateOf(false) }
+    var pendingRelay by remember { mutableStateOf<PendingRelay?>(null) }
+    var relayFeedback by remember { mutableStateOf<String?>(null) }
+
+    fun refreshCurrentTab() {
+        refreshRequest++
     }
 
-    fun refreshCurrentTab(showSpinner: Boolean = true) {
+    fun sendRelay(node: Long, endpoint: Int, on: Boolean) {
+        if (pendingRelay != null || readingsStale) return
+        val action = PendingRelay(node, endpoint, on, android.os.SystemClock.elapsedRealtime())
+        pendingRelay = action
+        relayFeedback = "Wysyłam polecenie do gniazdka…"
         scope.launch {
-            fetchTabData(selectedTab, showSpinner)
+            val result = client.controlRelay(node, endpoint, on)
+            if (pendingRelay != action) return@launch
+            if (!result.isOk && result.code in 400..499) {
+                pendingRelay = null
+                relayFeedback = result.json?.optString("message")?.ifBlank { null } ?: "Błąd sterowania (HTTP " + result.code + ")."
+                return@launch
+            }
+            relayFeedback = "Czekam na świeży odczyt stanu gniazdka…"
+            if (selectedTab == 1) refreshCurrentTab()
+            delay(30_000)
+            if (pendingRelay == action) {
+                pendingRelay = null
+                relayFeedback = "Brak potwierdzenia stanu gniazdka. Sprawdź odczyt przed ponowieniem."
+            }
         }
     }
 
-    // Live auto-refresh loop every 2.5s while on any tab
-    LaunchedEffect(selectedTab, client.ip) {
-        val isInitialEmpty = when (selectedTab) {
-            0 -> statusJson == null
-            1 -> devicesJson == null
-            2 -> statusJson == null
-            3 -> diagJson == null
-            else -> true
+    suspend fun fetchTabData(tab: Int) {
+        val requestedAt = android.os.SystemClock.elapsedRealtime()
+        val response = when (tab) {
+            1 -> client.getDevices()
+            3 -> client.getDiagnostics()
+            else -> client.getStatus()
         }
-        fetchTabData(selectedTab, showSpinner = isInitialEmpty)
+        if (response.code == 401) {
+            onLogout()
+            return
+        }
+        val json = response.json
+        if (!response.isOk || json == null || (tab == 1 && json.optJSONArray("devices") == null)) {
+            if (tab == 1) readingsStale = true
+            val detail = response.json?.optString("message")?.ifBlank { null } ?: response.error
+            errorMsg = if (tab == 1 && devicesJson != null) {
+                "Nie odświeżono pomiarów. Widoczne są ostatnie dostępne odczyty."
+            } else detail ?: "Nie udało się odświeżyć danych (HTTP " + response.code + ")."
+            return
+        }
+        errorMsg = null
+        when (tab) {
+            1 -> {
+                val devices = json.optJSONArray("devices")
+                devicesJson = devices
+                readingsStale = false
+                val action = pendingRelay
+                if (action != null && devices != null && devices.confirmsRelay(action, requestedAt)) {
+                    pendingRelay = null
+                    relayFeedback = if (action.on) "Potwierdzony stan gniazdka: włączone." else "Potwierdzony stan gniazdka: wyłączone."
+                }
+            }
+            3 -> diagJson = json
+            else -> statusJson = json
+        }
+        if ((tab == 0 || tab == 3) && settingsJson == null) {
+            val settings = client.get("/api/gateway/settings")
+            if (settings.isOk) settingsJson = settings.json
+        }
+    }
+
+    LaunchedEffect(selectedTab, refreshRequest, client) {
+        val tab = selectedTab
+        errorMsg = null
+        loading = true
+        try {
+            fetchTabData(tab)
+        } finally {
+            loading = false
+        }
         while (isActive) {
             delay(5000L)
-            fetchTabData(selectedTab, showSpinner = false)
+            fetchTabData(tab)
         }
     }
 
@@ -191,7 +209,7 @@ fun NativeGatewayPanelScreen(
                     }
                 },
                 actions = {
-                    IconButton(onClick = { refreshCurrentTab(showSpinner = true) }) {
+                    IconButton(onClick = { refreshCurrentTab() }) {
                         Icon(Icons.Default.Refresh, contentDescription = "Odśwież")
                     }
                     IconButton(onClick = onLogout) {
@@ -270,12 +288,15 @@ fun NativeGatewayPanelScreen(
                 0 -> DashboardTab(statusJson, gwTitle)
                 1 -> DevicesTab(
                     devices = devicesJson,
-                    client = client,
-                    onRefresh = { refreshCurrentTab() }
+                    actionFeedback = relayFeedback,
+                    canControl = !readingsStale && pendingRelay == null,
+                    onControl = ::sendRelay
                 )
                 2 -> PairMatterTab(
                     client = client,
                     statusJson = statusJson,
+                    pairingAttempt = pairingAttempt,
+                    onPairingAttempt = { pairingAttempt = it },
                     onRefreshStatus = { refreshCurrentTab() }
                 )
                 3 -> DiagnosticsTab(
@@ -348,6 +369,27 @@ private data class ParsedMetric(
     val isValid: Boolean
 )
 
+private data class PendingRelay(val node: Long, val endpoint: Int, val on: Boolean, val sentAtMs: Long)
+
+private fun JSONArray.confirmsRelay(action: PendingRelay, requestedAtMs: Long): Boolean {
+    if (requestedAtMs < action.sentAtMs) return false
+    for (index in 0 until length()) {
+        val device = optJSONObject(index) ?: continue
+        if (device.optLong("node") != action.node) continue
+        val values = device.optJSONObject("telemetry")?.optJSONArray("values") ?: return false
+        for (readingIndex in 0 until values.length()) {
+            val reading = values.optJSONObject(readingIndex) ?: continue
+            val kind = reading.optString("kind", reading.optString("metric", ""))
+            val ageSeconds = reading.optLong("received_age_s", -1)
+            if ((kind == "onoff" || kind == "on_off") && reading.optInt("endpoint") == action.endpoint &&
+                reading.optBoolean("valid") && reading.optDouble("value") == (if (action.on) 1.0 else 0.0) &&
+                ageSeconds >= 0 && ageSeconds <= (requestedAtMs - action.sentAtMs) / 1000) return true
+        }
+        return false
+    }
+    return false
+}
+
 private data class RelayControl(
     val endpoint: Int,
     val isOn: Boolean?
@@ -356,11 +398,10 @@ private data class RelayControl(
 @Composable
 private fun DevicesTab(
     devices: JSONArray?,
-    client: GatewayApiClient,
-    onRefresh: () -> Unit
+    actionFeedback: String?,
+    canControl: Boolean,
+    onControl: (Long, Int, Boolean) -> Unit
 ) {
-    val scope = rememberCoroutineScope()
-    var actionFeedback by remember { mutableStateOf<String?>(null) }
 
     val list = remember(devices) {
         buildList {
@@ -395,7 +436,7 @@ private fun DevicesTab(
 
         if (list.isEmpty()) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text("Brak sparowanych urządzeń Matter.", color = TextMuted)
+                Text(if (devices == null) "Brak aktualnej listy urządzeń." else "Brak sparowanych urządzeń Matter.", color = TextMuted)
             }
             return
         }
@@ -591,16 +632,8 @@ private fun DevicesTab(
                             modifier = Modifier.fillMaxWidth()
                         ) {
                             Button(
-                                onClick = {
-                                    scope.launch {
-                                        actionFeedback = "Wysyłanie WŁĄCZ do $name (EP${rc.endpoint})..."
-                                        val r = client.controlRelay(node, rc.endpoint, true)
-                                        val msg = r.json?.optString("message")?.ifEmpty { null }
-                                        actionFeedback = if (r.isOk) (msg ?: "Wysłano WŁĄCZ ($name).") else "Błąd: ${msg ?: r.error ?: r.code}"
-                                        delay(1500)
-                                        onRefresh()
-                                    }
-                                },
+                                enabled = canControl && rc.isOn == false,
+                                onClick = { onControl(node, rc.endpoint, true) },
                                 colors = ButtonDefaults.buttonColors(
                                     containerColor = if (rc.isOn == true) AccentGreen else Color(0xFF1F4E38)
                                 ),
@@ -613,16 +646,8 @@ private fun DevicesTab(
                                 )
                             }
                             OutlinedButton(
-                                onClick = {
-                                    scope.launch {
-                                        actionFeedback = "Wysyłanie WYŁĄCZ do $name (EP${rc.endpoint})..."
-                                        val r = client.controlRelay(node, rc.endpoint, false)
-                                        val msg = r.json?.optString("message")?.ifEmpty { null }
-                                        actionFeedback = if (r.isOk) (msg ?: "Wysłano WYŁĄCZ ($name).") else "Błąd: ${msg ?: r.error ?: r.code}"
-                                        delay(1500)
-                                        onRefresh()
-                                    }
-                                },
+                                enabled = canControl && rc.isOn == true,
+                                onClick = { onControl(node, rc.endpoint, false) },
                                 modifier = Modifier.weight(1f)
                             ) {
                                 Text("Wyłącz$epSuffix")
@@ -635,10 +660,14 @@ private fun DevicesTab(
     }
 }
 
+private data class PairingAttempt(val node: Long, val acceptedAtMs: Long)
+
 @Composable
 private fun PairMatterTab(
     client: GatewayApiClient,
     statusJson: JSONObject?,
+    pairingAttempt: PairingAttempt?,
+    onPairingAttempt: (PairingAttempt?) -> Unit,
     onRefreshStatus: () -> Unit
 ) {
     val scope = rememberCoroutineScope()
@@ -650,12 +679,37 @@ private fun PairMatterTab(
     var resultMessage by remember { mutableStateOf<String?>(null) }
     var resultIsError by remember { mutableStateOf(false) }
     var showQrScanner by remember { mutableStateOf(false) }
+    val acceptedNode = pairingAttempt?.node
 
     val pairing = statusJson?.optJSONObject("pairing")
     val pairState = pairing?.optString("state", "idle") ?: "idle"
     val pairMessage = pairing?.optString("message", "") ?: ""
     val pairNode = pairing?.optLong("node", 0L) ?: 0L
     val pairElapsed = pairing?.optInt("elapsed", 0) ?: 0
+
+    val pairingBusy = pairState in setOf("started", "commissioning", "removing")
+
+    LaunchedEffect(pairingAttempt, pairNode, pairState, pairMessage) {
+        val attempt = pairingAttempt ?: return@LaunchedEffect
+        when {
+            pairNode == attempt.node && (pairState == "success" || pairState == "failed") -> {
+                resultIsError = pairState == "failed"
+                val prefix = if (resultIsError) "Nie udało się sparować urządzenia." else "Urządzenie zostało sparowane."
+                resultMessage = if (pairMessage.isBlank()) prefix else "$prefix $pairMessage"
+            }
+            pairNode > attempt.node -> {
+                resultIsError = true
+                resultMessage = "Bramka rozpoczęła inną operację. Sprawdź listę urządzeń."
+            }
+            else -> {
+                val remaining = attempt.acceptedAtMs + 180_000 - android.os.SystemClock.elapsedRealtime()
+                delay(remaining.coerceAtLeast(0))
+                resultIsError = true
+                resultMessage = "Upłynął czas oczekiwania na wynik. Sprawdź listę urządzeń."
+            }
+        }
+        onPairingAttempt(null)
+    }
 
     if (showQrScanner) {
         QrScannerDialog(
@@ -664,7 +718,7 @@ private fun PairMatterTab(
                 code = scannedText
                 showQrScanner = false
                 resultIsError = false
-                resultMessage = "Zeskanowano kod QR: $scannedText"
+                resultMessage = "Odczytano kod QR."
             }
         )
     }
@@ -757,10 +811,12 @@ private fun PairMatterTab(
             Spacer(Modifier.height(14.dp))
 
             Button(
-                enabled = !submitting && code.isNotBlank(),
+                enabled = !submitting && acceptedNode == null && !pairingBusy &&
+                    code.isNotBlank() && (network != "wifi" || wifiSsid.isNotEmpty()),
                 onClick = {
+                    if (submitting || acceptedNode != null || pairingBusy) return@Button
+                    submitting = true
                     scope.launch {
-                        submitting = true
                         resultMessage = null
                         val res = client.pairMatter(
                             code = code,
@@ -770,9 +826,13 @@ private fun PairMatterTab(
                         )
                         submitting = false
                         val msg = res.json?.optString("message")?.ifEmpty { null }
-                        if (res.isOk) {
+                        val startedNode = res.json?.optLong("node", 0L) ?: 0L
+                        if (res.isOk && startedNode > 0) {
+                            onPairingAttempt(PairingAttempt(startedNode, android.os.SystemClock.elapsedRealtime()))
+                            code = ""
+                            wifiPass = ""
                             resultIsError = false
-                            resultMessage = msg ?: "Rozpoczęto parowanie na bramce."
+                            resultMessage = "Trwa parowanie urządzenia."
                             onRefreshStatus()
                         } else {
                             resultIsError = true
@@ -784,7 +844,11 @@ private fun PairMatterTab(
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Text(
-                    text = if (submitting) "Wysyłanie..." else "Sparuj urządzenie",
+                    text = when {
+                        submitting -> "Wysyłanie…"
+                        acceptedNode != null || pairingBusy -> "Trwa operacja Matter…"
+                        else -> "Sparuj urządzenie"
+                    },
                     color = Color(0xFF062111),
                     fontWeight = FontWeight.SemiBold
                 )
@@ -801,7 +865,19 @@ private fun PairMatterTab(
         }
 
         InfoCard("Status parowania na bramce") {
-            KeyVal("Stan", pairState, if (pairState == "idle") TextMuted else AccentGreen)
+            val stateLabel = when (pairState) {
+                "started", "commissioning" -> "Parowanie w toku"
+                "removing" -> "Usuwanie w toku"
+                "success" -> "Zakończono"
+                "failed" -> "Błąd"
+                else -> "Brak aktywnej operacji"
+            }
+            KeyVal("Stan", stateLabel, when (pairState) {
+                "failed" -> ErrorRed
+                "success" -> AccentGreen
+                "idle" -> TextMuted
+                else -> WarnAmber
+            })
             if (pairNode > 0) {
                 KeyVal("Węzeł (Node)", pairNode.toString())
             }

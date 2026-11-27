@@ -130,7 +130,13 @@ object GatewayDiscovery {
     }
 
     suspend fun probeSingleIp(ip: String): DiscoveredGateway? = withContext(Dispatchers.IO) {
-        probeGateway(ip.trim(), "Ręczny IP", connectTimeoutMs = 1500)
+        val groups = ip.trim().split('.')
+        if (groups.size != 4) return@withContext null
+        val octets = groups.map {
+            it.takeIf { part -> part.length in 1..3 && part.all { digit -> digit in '0'..'9' } }
+                ?.toIntOrNull()?.takeIf { octet -> octet in 0..255 } ?: return@withContext null
+        }
+        probeGateway(octets.joinToString("."), "Ręczny IP", connectTimeoutMs = 1500)
     }
 
     private suspend fun discoverViaNsd(context: Context, durationMs: Long): Set<String> {
@@ -171,12 +177,14 @@ object GatewayDiscovery {
             }
         }
 
-        delay(durationMs)
-
-        for (listener in listeners) {
-            try {
-                nsdManager.stopServiceDiscovery(listener)
-            } catch (_: Exception) {
+        try {
+            delay(durationMs)
+        } finally {
+            for (listener in listeners) {
+                try {
+                    nsdManager.stopServiceDiscovery(listener)
+                } catch (_: Exception) {
+                }
             }
         }
         return discovered

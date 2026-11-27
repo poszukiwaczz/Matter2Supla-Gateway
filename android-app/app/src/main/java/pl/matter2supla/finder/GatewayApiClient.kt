@@ -23,7 +23,7 @@ data class ApiResult(
     val rawBody: String,
     val error: String? = null
 ) {
-    val isOk: Boolean get() = code in 200..299 && error == null
+    val isOk: Boolean get() = code in 200..299 && error == null && json?.optBoolean("ok", true) == true
 }
 
 class GatewayApiClient(
@@ -108,6 +108,7 @@ class GatewayApiClient(
                     requestMethod = method
                     connectTimeout = timeoutMs
                     readTimeout = timeoutMs
+                    instanceFollowRedirects = false
                     useCaches = false
                     setRequestProperty("Host", ip)
                     setRequestProperty("Origin", "https://$ip")
