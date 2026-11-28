@@ -12,11 +12,12 @@
 
 ## 2. Którą wersję i parę plików S3 + C6 wybrać?
 
-| Wydanie | Plik ESP32-S3 (czysta płytka `0x0`) | Plik ESP32-C6 (czysta płytka `0x0`) | Uwagi |
-|---|---|---|---|
-| **Stabilna `0.3.5`** (32 urz., test ~72 h) | `Matter2Supla-0.3.5-S3-N16R8-FULL-FLASH-0x0.bin` | `Matter2Supla-C6-4MB-FACTORY.bin` *(lub `8MB`, z `IDF-6.1.1`)* | Zalecana do codziennej pracy. Wymaga sprawnego połączenia S3↔C6 już przy starcie. |
-| **`0.4.5` standard** (64 urz.) | `Matter2Supla-0.4.5-S3-N16R8-FULL-FLASH-0x0.bin` | `Matter2Supla-C6-4MB-FACTORY.bin` *(lub `1.1.1-c6-ota`)* | Wi-Fi i panel WWW (`Matter-GW-XXXX` / `https://192.168.4.1`) startują **nawet bez podłączonego C6**; po podłączeniu C6 Thread wstaje automatycznie bez restartu S3. |
-| **`0.4.5-singleusb`** (64 urz. + zdalne OTA C6) | `Matter2Supla-0.4.5-singleusb-S3-N16R8-FULL-FLASH-0x0.bin` | `Matter2Supla-RCP-C6-1.1.1-c6-ota-FULL-FLASH-0x0.bin` *(później aktualizacje przez `*-OTA.m2s`)* | Zdalne OTA radia C6 po jednym kablu USB-C ↔ USB-C (szczegóły: [SINGLE-USB-OTA.md](SINGLE-USB-OTA.md)) + niezależny start Wi-Fi/panelu bez C6. |
+| Status | Wydanie | Plik ESP32-S3 (czysta płytka `0x0`) | Plik ESP32-C6 (czysta płytka `0x0`) | Uwagi |
+|---|---|---|---|---|
+| **STABILNA** | **`0.3.5`** (32 urz., test ~72 h PASS) | `Matter2Supla-0.3.5-S3-N16R8-FULL-FLASH-0x0.bin` | `Matter2Supla-C6-4MB-FACTORY.bin` *(lub `8MB`, z `IDF-6.1.1`)* | Zalecana do codziennej pracy. Wymaga sprawnego połączenia S3↔C6 już przy starcie. |
+| **KANDYDAT STABILNY** | **`0.3.6`** (32 urz., baza `0.3.5`) | `Matter2Supla-0.3.6-S3-N16R8-FULL-FLASH-0x0.bin` | `Matter2Supla-C6-4MB-FACTORY.bin` *(lub `8MB`, z `IDF-6.1.1`)* | Wszystko ze stabilnej `0.3.5` + **Wi-Fi (`Matter-GW-XXXX`) i panel HTTPS startują nawet bez podłączonego C6**; po podłączeniu C6 Thread wstaje automatycznie bez restartu S3. |
+| **BETA DO TESTÓW** | **`0.4.5` standard** (64 urz.) | `Matter2Supla-0.4.5-S3-N16R8-FULL-FLASH-0x0.bin` | `Matter2Supla-C6-4MB-FACTORY.bin` *(lub `1.1.1-c6-ota`)* | Skalowanie do 64 urządzeń + niezależny start Wi-Fi/panelu bez C6. Przed pełnym testem długotrwałym. |
+| **BETA DO TESTÓW** | **`0.4.5-singleusb`** (64 urz. + OTA C6) | `Matter2Supla-0.4.5-singleusb-S3-N16R8-FULL-FLASH-0x0.bin` | `Matter2Supla-RCP-C6-1.1.1-c6-ota-FULL-FLASH-0x0.bin` *(później aktualizacje przez `*-OTA.m2s`)* | Zdalne OTA radia C6 po jednym kablu USB-C ↔ USB-C (szczegóły: [SINGLE-USB-OTA.md](SINGLE-USB-OTA.md)) + niezależny start Wi-Fi/panelu bez C6. |
 
 > **Połączenie sprzętowe S3 ↔ C6:** obie płytki łączy się kablem **USB-C z liniami danych (D+/D-)** wpiętym w **natywne gniazda USB** (S3 `GPIO19`/`GPIO20` ↔ C6 `GPIO12`/`GPIO13`, `UART1 2 Mb/s`). Zwykły kabel „tylko do ładowania” nie zadziała. Do podglądu logów na komputerze służy osobny port **UART/COM (`115200 8N1`)** na S3.
 
