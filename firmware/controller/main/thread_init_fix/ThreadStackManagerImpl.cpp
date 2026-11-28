@@ -45,6 +45,8 @@
 #include <platform/OpenThread/OpenThreadUtils.h>
 #include <platform/ThreadStackManager.h>
 
+extern "C" bool m2s_c6_rcp_probe(int max_attempts);
+
 namespace chip {
 namespace DeviceLayer {
 
@@ -54,6 +56,11 @@ ThreadStackManagerImpl ThreadStackManagerImpl::sInstance;
 
 CHIP_ERROR ThreadStackManagerImpl::_InitThreadStack()
 {
+    if (!m2s_c6_rcp_probe(3))
+    {
+        ESP_LOGW("ThreadStack", "C6 RCP not responding on UART1; deferring OpenThread init so Wi-Fi and panel start normally");
+        return CHIP_ERROR_TIMEOUT;
+    }
     CHIP_ERROR err   = CHIP_NO_ERROR;
     esp_err_t espErr = openthread_init_stack();
     VerifyOrReturnError(espErr == ESP_OK, ESP32Utils::MapError(espErr));

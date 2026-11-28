@@ -483,6 +483,9 @@ struct thread_info_t {
 thread_info_t get_thread_info()
 {
     thread_info_t info = {"disabled", 0, false};
+    if (!esp_openthread_get_instance()) {
+        return info;
+    }
     if (!esp_openthread_lock_acquire(pdMS_TO_TICKS(30))) {
         info.role = "busy";
         return info;
@@ -515,6 +518,9 @@ bool fetch_dataset(uint8_t *buffer, size_t buffer_size, size_t *out_len)
 {
     bool ok = false;
     otOperationalDatasetTlvs tlvs;
+    if (!esp_openthread_get_instance()) {
+        return false;
+    }
     if (!esp_openthread_lock_acquire(pdMS_TO_TICKS(100))) {
         return false;
     }

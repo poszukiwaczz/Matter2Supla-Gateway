@@ -8,5 +8,5 @@
 
 #pragma once
 
-#define FW_VERSION "0.3.5"
-#define FW_BUILD 30500
+#define FW_VERSION "0.3.6"
+#define FW_BUILD 30600

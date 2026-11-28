@@ -31,6 +31,7 @@
 #include <memory>
 #include <cstring>
 extern "C" cJSON *supla_bridge_cloud_map();
+extern "C" bool m2s_try_deferred_thread_start();
 namespace gateway {
 namespace {
 std::atomic_flag operation=ATOMIC_FLAG_INIT;portMUX_TYPE guard=portMUX_INITIALIZER_UNLOCKED;
@@ -168,6 +169,7 @@ bool services_ok(){
 void work(void*){gateway_worker.store(xTaskGetCurrentTaskHandle());int64_t next=0;for(;;){const auto now=esp_timer_get_time();
  s_rtc_crash.current_uptime_s = static_cast<uint32_t>(now / 1000000);
  if(now>=next){Radio r;portENTER_CRITICAL(&guard);r=radio;portEXIT_CRITICAL(&guard);r.tried=now;
+  if(!esp_openthread_get_instance()) m2s_try_deferred_thread_start();
   if(esp_openthread_get_instance()&&esp_openthread_lock_acquire(pdMS_TO_TICKS(20))){int8_t power=0;r.result=otPlatRadioGetTransmitPower(esp_openthread_get_instance(),&power);
    if(r.result==ESP_OK){r.good=esp_timer_get_time();r.consecutive_failed=0;const char *v=otPlatRadioGetVersionString(esp_openthread_get_instance());snprintf(r.version,sizeof(r.version),"%s",v?v:"");}
    else {++r.failed;++r.consecutive_failed;}
