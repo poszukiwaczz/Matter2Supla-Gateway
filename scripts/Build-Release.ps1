@@ -1,6 +1,6 @@
 param(
     [ValidateSet('standard','singleusb')][string]$Variant = 'standard',
-    [string]$SigningKey = 'M:\matter2supla\next-0.3\private\update-signing-key.pem',
+    [string]$SigningKey = (Join-Path $PSScriptRoot '..\private\update-signing-key.pem'),
     [string]$EspRoot = 'C:\esp',
     [switch]$UseConfiguredBuild,
     [switch]$CompileOnly   # build and verify only: no artifacts, no build number consumed

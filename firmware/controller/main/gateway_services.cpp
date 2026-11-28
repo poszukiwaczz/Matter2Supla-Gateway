@@ -31,6 +31,7 @@
 #include <memory>
 #include <cstring>
 extern "C" cJSON *supla_bridge_cloud_map();
+extern "C" bool m2s_try_deferred_thread_start();
 #if CONFIG_M2S_SINGLE_USB_RCP_OTA
 extern "C" bool m2s_read_rcp_ota_version(char *out, size_t capacity);
 #endif
@@ -176,6 +177,7 @@ void work(void*){gateway_worker.store(xTaskGetCurrentTaskHandle());int64_t next=
  if(now>=next){Radio r;portENTER_CRITICAL(&guard);r=radio;portEXIT_CRITICAL(&guard);r.tried=now;
   char verification_version[128]{};
   const bool verifying_rcp=rcp_ota_verification_pending();
+  if(!esp_openthread_get_instance()) m2s_try_deferred_thread_start();
   if(esp_openthread_get_instance()&&esp_openthread_lock_acquire(pdMS_TO_TICKS(20))){int8_t power=0;r.result=otPlatRadioGetTransmitPower(esp_openthread_get_instance(),&power);
    if(r.result==ESP_OK){r.good=esp_timer_get_time();r.consecutive_failed=0;if(!r.version[0]){const char *v=otPlatRadioGetVersionString(esp_openthread_get_instance());snprintf(r.version,sizeof(r.version),"%s",v?v:"");}}
    else {++r.failed;++r.consecutive_failed;}

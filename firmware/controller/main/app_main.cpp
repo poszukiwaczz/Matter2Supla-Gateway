@@ -12,6 +12,8 @@
 */
 
 #include <cJSON.h>
+#include <atomic>
+#include <driver/uart.h>
 #include <esp_attr.h>
 #include <esp_err.h>
 #include <esp_console.h>
@@ -21,6 +23,7 @@
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
 #include <esp_system.h>
+#include <esp_timer.h>
 #include <nvs_flash.h>
 
 #include <esp_matter.h>
@@ -30,6 +33,7 @@
 #include <esp_matter_controller_utils.h>
 #include <esp_matter_ota.h>
 #if CONFIG_OPENTHREAD_BORDER_ROUTER
+#include <esp_openthread.h>
 #include <esp_openthread_border_router.h>
 #include <esp_openthread_lock.h>
 #include <openthread/dataset.h>
@@ -38,10 +42,11 @@
 #include <openthread/thread.h>
 #include <esp_ot_config.h>
 #include <esp_spiffs.h>
+#include <platform/ThreadStackManager.h>
+#include <app/server/Dnssd.h>
 #if defined(CONFIG_AUTO_UPDATE_RCP)
 #include <esp_ot_rcp_update.h>
 #include <esp_rcp_update.h>
-#include <platform/ThreadStackManager.h>
 #endif
 #include <platform/ESP32/OpenthreadLauncher.h>
 #endif // CONFIG_OPENTHREAD_BORDER_ROUTER
@@ -69,6 +74,188 @@ static chip::Credentials::json_set_da_revocation_delegate s_custom_delegate((con
 static const char *TAG = "app_main";
 uint16_t switch_endpoint_id = 0;
 
+#if CONFIG_OPENTHREAD_BORDER_ROUTER
+namespace {
+
+std::atomic<bool> s_sta_got_ip{false};
+std::atomic<bool> s_thread_br_initialized{false};
+std::atomic<bool> s_rcp_probe_bypass{false};
+
+uint16_t rcp_hdlc_fcs(const uint8_t *data, size_t len)
+{
+    uint16_t fcs = 0xFFFFu;
+    for (size_t i = 0; i < len; ++i) {
+        fcs ^= data[i];
+        for (int bit = 0; bit < 8; ++bit) {
+            fcs = (fcs & 1u) ? static_cast<uint16_t>((fcs >> 1) ^ 0x8408u) : static_cast<uint16_t>(fcs >> 1);
+        }
+    }
+    return static_cast<uint16_t>(fcs ^ 0xFFFFu);
+}
+
+void rcp_hdlc_push(uint8_t *dst, size_t &pos, uint8_t b)
+{
+    if (b == 0x7Eu || b == 0x7Du || b == 0x11u || b == 0x13u || b == 0xF8u) {
+        dst[pos++] = 0x7Du;
+        dst[pos++] = static_cast<uint8_t>(b ^ 0x20u);
+    } else {
+        dst[pos++] = b;
+    }
+}
+
+void try_init_thread_br()
+{
+    if (s_thread_br_initialized.load() || !s_sta_got_ip.load()) return;
+    if (!esp_openthread_get_instance()) return;
+    esp_openthread_set_backbone_netif(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"));
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    esp_err_t br_err = esp_openthread_border_router_init();
+    otInstance *instance = esp_openthread_get_instance();
+    otError thread_err = OT_ERROR_INVALID_STATE;
+    if (br_err == ESP_OK && instance != nullptr) {
+        thread_err = OT_ERROR_NONE;
+        // Generate unique credentials once; preserve the same network on reboot.
+        if (!otDatasetIsCommissioned(instance)) {
+            otOperationalDataset dataset = {};
+            thread_err = otDatasetCreateNewNetwork(instance, &dataset);
+            if (thread_err == OT_ERROR_NONE) thread_err = otDatasetSetActive(instance, &dataset);
+        }
+        if (thread_err == OT_ERROR_NONE) thread_err = otIp6SetEnabled(instance, true);
+        if (thread_err == OT_ERROR_NONE) thread_err = otThreadSetEnabled(instance, true);
+    }
+    esp_openthread_lock_release();
+    if (br_err == ESP_OK && thread_err == OT_ERROR_NONE) {
+        s_thread_br_initialized.store(true);
+    }
+    ESP_LOGI(TAG, "Thread startup: BR=%s, Thread=%d", esp_err_to_name(br_err), (int)thread_err);
+}
+
+} // namespace
+
+// Non-blocking Spinel HDLC probe on UART1 so S3 can boot Wi-Fi & HTTPS panel even if C6 is disconnected.
+extern "C" bool m2s_c6_rcp_probe(int max_attempts)
+{
+    if (s_rcp_probe_bypass.load() || esp_openthread_get_instance() != nullptr) return true;
+#if CONFIG_OPENTHREAD_RADIO_SPINEL_UART
+    const uart_port_t port = UART_NUM_1;
+    const uart_config_t cfg = {
+        .baud_rate = 2000000,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .rx_flow_ctrl_thresh = 0,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    if (uart_driver_install(port, 1024, 512, 0, nullptr, 0) != ESP_OK) return false;
+    uart_param_config(port, &cfg);
+    uart_set_pin(port, GPIO_NUM_19, GPIO_NUM_20, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+
+    // Spinel CMD_PROP_VALUE_GET(SPINEL_PROP_PROTOCOL_VERSION = 1) with FLG=2, IID=0, TID=1
+    const uint8_t req[3] = {0x81u, 0x02u, 0x01u};
+    const uint16_t req_fcs = rcp_hdlc_fcs(req, sizeof(req));
+    uint8_t tx[20];
+    size_t tx_len = 0;
+    tx[tx_len++] = 0x7Eu;
+    for (uint8_t b : req) rcp_hdlc_push(tx, tx_len, b);
+    rcp_hdlc_push(tx, tx_len, static_cast<uint8_t>(req_fcs & 0xFFu));
+    rcp_hdlc_push(tx, tx_len, static_cast<uint8_t>((req_fcs >> 8) & 0xFFu));
+    tx[tx_len++] = 0x7Eu;
+
+    bool found = false;
+    uint8_t frame[128];
+    if (max_attempts < 1) max_attempts = 1;
+    for (int attempt = 0; attempt < max_attempts && !found; ++attempt) {
+        uart_flush_input(port);
+        uart_write_bytes(port, tx, tx_len);
+        uart_wait_tx_done(port, pdMS_TO_TICKS(30));
+
+        const int64_t deadline = esp_timer_get_time() + 250000LL; // 250 ms per attempt
+        size_t flen = 0;
+        bool in_frame = false;
+        bool escaped = false;
+        while (esp_timer_get_time() < deadline && !found) {
+            uint8_t rx[64];
+            int n = uart_read_bytes(port, rx, sizeof(rx), pdMS_TO_TICKS(20));
+            for (int i = 0; i < n; ++i) {
+                const uint8_t b = rx[i];
+                if (b == 0x7Eu) {
+                    if (in_frame && flen >= 5) {
+                        const uint16_t rx_fcs = static_cast<uint16_t>(frame[flen - 2]) |
+                                                static_cast<uint16_t>(frame[flen - 1] << 8);
+                        if ((frame[0] & 0xC0u) == 0x80u && rcp_hdlc_fcs(frame, flen - 2) == rx_fcs) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    in_frame = true;
+                    flen = 0;
+                    escaped = false;
+                } else if (in_frame) {
+                    if (escaped) {
+                        if (flen < sizeof(frame)) frame[flen++] = static_cast<uint8_t>(b ^ 0x20u);
+                        escaped = false;
+                    } else if (b == 0x7Du) {
+                        escaped = true;
+                    } else if (flen < sizeof(frame)) {
+                        frame[flen++] = b;
+                    }
+                }
+            }
+        }
+    }
+    uart_driver_delete(port);
+    return found;
+#else
+    return true;
+#endif
+}
+
+// Called periodically by gateway_services when S3 booted without C6.
+// Once C6 responds on UART1, initializes OpenThread & Border Router live without rebooting S3.
+extern "C" bool m2s_try_deferred_thread_start()
+{
+    if (esp_openthread_get_instance() != nullptr) {
+        try_init_thread_br();
+        return true;
+    }
+    if (!m2s_c6_rcp_probe(1)) return false;
+
+    ESP_LOGI(TAG, "C6 RCP detected on UART1; starting OpenThread stack without S3 reboot");
+    s_rcp_probe_bypass.store(true);
+    CHIP_ERROR err = CHIP_NO_ERROR;
+    {
+        esp_matter::lock::ScopedChipStackLock lock(portMAX_DELAY);
+        err = chip::DeviceLayer::ThreadStackMgr().InitThreadStack();
+        if (err == CHIP_NO_ERROR) {
+            err = chip::DeviceLayer::ConnectivityMgr().SetThreadDeviceType(
+                chip::DeviceLayer::ConnectivityManager::kThreadDeviceType_Router);
+        }
+        if (err == CHIP_NO_ERROR) {
+            err = chip::DeviceLayer::ThreadStackMgr().StartThreadTask();
+        }
+    }
+    s_rcp_probe_bypass.store(false);
+    if (err != CHIP_NO_ERROR) {
+        ESP_LOGW(TAG, "Deferred Thread init failed: %" CHIP_ERROR_FORMAT, err.Format());
+        return false;
+    }
+
+    try_init_thread_br();
+    {
+        esp_matter::lock::ScopedChipStackLock lock(portMAX_DELAY);
+        if (chip::DeviceLayer::ConnectivityMgr().IsThreadProvisioned() &&
+            chip::Server::GetInstance().GetFabricTable().FabricCount() != 0) {
+            chip::app::DnssdServer::Instance().StartServer();
+        }
+    }
+    return esp_openthread_get_instance() != nullptr;
+}
+#else
+extern "C" bool m2s_c6_rcp_probe(int) { return true; }
+extern "C" bool m2s_try_deferred_thread_start() { return true; }
+#endif // CONFIG_OPENTHREAD_BORDER_ROUTER
+
 static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg)
 {
     switch (event->Type) {
@@ -79,28 +266,8 @@ static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg)
         if (event->Platform.ESPSystemEvent.Base == IP_EVENT &&
                 event->Platform.ESPSystemEvent.Id == IP_EVENT_STA_GOT_IP) {
 #if CONFIG_OPENTHREAD_BORDER_ROUTER
-            static bool sThreadBRInitialized = false;
-            if (!sThreadBRInitialized) {
-                esp_openthread_set_backbone_netif(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"));
-                esp_openthread_lock_acquire(portMAX_DELAY);
-                esp_err_t br_err = esp_openthread_border_router_init();
-                otInstance *instance = esp_openthread_get_instance();
-                otError thread_err = OT_ERROR_INVALID_STATE;
-                if (br_err == ESP_OK && instance != nullptr) {
-                    thread_err = OT_ERROR_NONE;
-                    // Generate unique credentials once; preserve the same network on reboot.
-                    if (!otDatasetIsCommissioned(instance)) {
-                        otOperationalDataset dataset = {};
-                        thread_err = otDatasetCreateNewNetwork(instance, &dataset);
-                        if (thread_err == OT_ERROR_NONE) thread_err = otDatasetSetActive(instance, &dataset);
-                    }
-                    if (thread_err == OT_ERROR_NONE) thread_err = otIp6SetEnabled(instance, true);
-                    if (thread_err == OT_ERROR_NONE) thread_err = otThreadSetEnabled(instance, true);
-                }
-                esp_openthread_lock_release();
-                sThreadBRInitialized = br_err == ESP_OK && thread_err == OT_ERROR_NONE;
-                ESP_LOGI(TAG, "Thread startup: BR=%s, Thread=%d", esp_err_to_name(br_err), (int)thread_err);
-            }
+            s_sta_got_ip.store(true);
+            try_init_thread_br();
 #endif
         }
         break;
